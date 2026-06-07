@@ -19,12 +19,17 @@ def get_client():
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """texts → embeddings (rotation ይሠራል)"""
+    # NVIDIA models input_type ይፈልጋሉ — OpenAI አያስፈልጋቸውም
+    is_nvidia = "nvidia" in BASE_URL or "nvidia" in EMBED_MODEL.lower()
+    extra     = {"input_type": "passage", "truncate": "END"} if is_nvidia else {}
+
     while True:
         try:
             client = get_client()
             resp   = client.embeddings.create(
                 model=EMBED_MODEL,
                 input=texts,
+                extra_body=extra if extra else None,
             )
             return [r.embedding for r in resp.data]
         except Exception as e:
