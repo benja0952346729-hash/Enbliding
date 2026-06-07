@@ -8,13 +8,6 @@ from config import get_game_config, DATABASE_URL, get_api_key, rotate_key, BASE_
 from game_logic import Board
 
 # ── Embedding Client ─────────────────────────────────────────────
-# .env ላይ AI_BASE_URL እና AI_API_KEY_1 ብቻ ቀይር
-# NVIDIA:   AI_BASE_URL=https://integrate.api.nvidia.com/v1
-#           EMBED_MODEL=nvidia/nv-embedqa-e5-v5
-# OpenAI:   AI_BASE_URL=https://api.openai.com/v1
-#           EMBED_MODEL=text-embedding-3-small
-# Groq:     Groq embedding የለም → OpenAI ተጠቀም
-
 import os
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
 
@@ -79,7 +72,7 @@ TAKEN_REPLIES_EN = [
 ]
 REMAINING_KEYWORDS = ["ቀሪ", "ነቃይ", "remaining", "ቀሪዎች"]
 
-# ─── Amharic Numbers (ለ training data) ───────────────────────────
+# ─── Amharic Numbers ─────────────────────────────────────────────
 AMHARIC_NUMBERS = {
     1: "አንድ", 2: "ሁለት", 3: "ሶስት", 4: "አራት", 5: "አምስት",
     6: "ስድስት", 7: "ሰባት", 8: "ስምንት", 9: "ዘጠኝ", 10: "አስር",
@@ -111,7 +104,6 @@ def format_block_request(block, is_half, lang="am"):
             f"{block} ይያዝ", f"{block:02d} ይያዝ",
             f"{block} ቁጥር ያዝ",
         ]
-        # አማርኛ ቁጥር ጨምር
         if am_num:
             styles += [
                 f"{am_num} ያዝ", f"{am_num}",
@@ -401,8 +393,17 @@ def setup_db():
     conn = get_conn()
     cur  = conn.cursor()
 
+    # ── ሙሉ clean start ──────────────────────────────────────────
+    cur.execute("DROP TABLE IF EXISTS training_embeddings CASCADE;")
+    cur.execute("DROP TABLE IF EXISTS training_events CASCADE;")
+    print("🗑️ ያሉ tables ተሰርዘዋል")
+
+    # ── Extension ───────────────────────────────────────────────
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+    # ── training_events ─────────────────────────────────────────
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS training_events (
+        CREATE TABLE training_events (
             id         SERIAL PRIMARY KEY,
             game_id    INTEGER,
             event_type TEXT,
@@ -412,30 +413,25 @@ def setup_db():
         )
     """)
 
-    cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS training_embeddings (
+    # ── training_embeddings ──────────────────────────────────────
+    embed_dim = int(os.getenv("EMBED_DIM", "1024"))
+    cur.execute(f"""
+        CREATE TABLE training_embeddings (
             id         SERIAL PRIMARY KEY,
             event_id   INTEGER REFERENCES training_events(id),
             event_type TEXT,
             content    TEXT,
-            embedding  vector(1024)
+            embedding  vector({embed_dim})
         )
     """)
 
-    # NVIDIA NV-Embed = 1024 dim | OpenAI text-embedding-3-small = 1536 dim
-    # .env ላይ EMBED_DIM ቀይር ካስፈለገ
-    embed_dim = int(os.getenv("EMBED_DIM", "1024"))
-    cur.execute(f"""
-        CREATE INDEX IF NOT EXISTS embedding_idx
+    # ── Index ────────────────────────────────────────────────────
+    cur.execute("""
+        CREATE INDEX embedding_idx
         ON training_embeddings
         USING ivfflat (embedding vector_cosine_ops)
         WITH (lists = 100);
     """)
-
-    cur.execute("TRUNCATE TABLE training_embeddings RESTART IDENTITY;")
-    cur.execute("TRUNCATE TABLE training_events RESTART IDENTITY CASCADE;")
 
     conn.commit()
     cur.close()
@@ -496,7 +492,7 @@ def run_training(num_games=5000):
         # 1. Save events
         event_ids = save_events(chunk_events)
 
-        # 2. Embed — API (sentence-transformers አያስፈልግም!)
+        # 2. Embed
         contents   = [e.get("content", "") for e in chunk_events]
         embeddings = embed_texts(contents)
 
