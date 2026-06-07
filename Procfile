@@ -1,1 +1,2 @@
-web: python embed_training.py && python bot.py
+worker: python embed_training.py
+web: python bot.py
