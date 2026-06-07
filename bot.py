@@ -18,10 +18,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_IDS      = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-# ── Embedding config — .env ላይ ብቻ ቀይር ──────────────────────────
-# embed_training.py ጋር አንድ አይነት መሆን አለበት!
-# NVIDIA:  EMBED_MODEL=nvidia/nv-embedqa-e5-v5   EMBED_DIM=1024
-# OpenAI:  EMBED_MODEL=text-embedding-3-small    EMBED_DIM=1536
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
 EMBED_DIM   = int(os.getenv("EMBED_DIM", "1024"))
 
@@ -35,23 +31,18 @@ def get_conn():
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. EMBEDDING — config ጋር unified
+# 2. EMBEDDING
 # ══════════════════════════════════════════════════════════════════
 
 def get_embedding(text: str) -> list:
-    """User message → vector (embed_training.py ጋር አንድ አይነት)"""
     while True:
         try:
             client = OpenAI(api_key=get_api_key(), base_url=BASE_URL)
-            resp   = client.embeddings.create(
-                model=EMBED_MODEL,
-                input=text,
-            )
+            resp   = client.embeddings.create(model=EMBED_MODEL, input=text)
             return resp.data[0].embedding
         except Exception as e:
             err = str(e).lower()
             if "rate limit" in err or "429" in err or "quota" in err:
-                logger.warning(f"Embedding rate limit — rotating key")
                 rotate_key()
             else:
                 logger.error(f"Embedding error: {e}")
@@ -59,24 +50,56 @@ def get_embedding(text: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3. RAG — pgvector similarity search
+# 3. VECTOR LOOKUP (አዲስ ⚡ — ፈጣን)
 # ══════════════════════════════════════════════════════════════════
 
-def rag_search(user_message: str, limit: int = 6) -> list:
-    """user message ጋር ቅርብ training examples ያመጣል"""
-    embedding = get_embedding(user_message)
-    if not embedding:
-        return []
+from trainer import extract_features
+
+def vector_lookup(event_data: dict, threshold: float = 0.92) -> str | None:
+    """
+    feature vector → DB vector_store similarity search
+    ቅርብ reply ካለ ይመልሳል፣ threshold ካልደረሰ None (→ AI fallback)
+    """
+    cfg      = get_game_config()
+    features = extract_features(event_data, cfg)
 
     try:
         conn = get_conn()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT
-                emb.event_type,
-                emb.content,
-                te.data,
-                1 - (emb.embedding <=> %s::vector) AS similarity
+                reply,
+                1 - (features <=> %s::vector) AS similarity
+            FROM vector_store
+            ORDER BY features <=> %s::vector
+            LIMIT 1
+        """, (features, features))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row and row["similarity"] >= threshold:
+            return row["reply"]
+        return None
+    except Exception as e:
+        logger.error(f"Vector lookup error: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4. RAG (edge case fallback)
+# ══════════════════════════════════════════════════════════════════
+
+def rag_search(user_message: str, limit: int = 6) -> list:
+    embedding = get_embedding(user_message)
+    if not embedding:
+        return []
+    try:
+        conn = get_conn()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT emb.event_type, emb.content, te.data,
+                   1 - (emb.embedding <=> %s::vector) AS similarity
             FROM training_embeddings emb
             JOIN training_events te ON te.id = emb.event_id
             ORDER BY emb.embedding <=> %s::vector
@@ -89,7 +112,6 @@ def rag_search(user_message: str, limit: int = 6) -> list:
     except Exception as e:
         logger.error(f"RAG search error: {e}")
         return []
-
 
 def format_rag_context(events: list) -> str:
     if not events:
@@ -104,7 +126,7 @@ def format_rag_context(events: list) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 4. AI CALL — auto rotate
+# 5. AI CALL (edge case only)
 # ══════════════════════════════════════════════════════════════════
 
 def call_ai(messages: list, system_prompt: str = None) -> str:
@@ -116,32 +138,27 @@ def call_ai(messages: list, system_prompt: str = None) -> str:
         try:
             client = OpenAI(api_key=get_api_key(), base_url=BASE_URL)
             resp   = client.chat.completions.create(
-                model=MODEL,
-                messages=messages,
-                max_tokens=1024,
+                model=MODEL, messages=messages, max_tokens=1024,
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
             err = str(e).lower()
             if "rate limit" in err or "429" in err or "quota" in err:
-                logger.warning(f"Rate limit — rotating key ({attempt+1})")
                 rotate_key()
             else:
                 raise e
-
     return "❌ AI አልተገናኘም። ቆይ ድጋሚ ሞክር።"
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. GAME STATE
+# 6. GAME STATE
 # ══════════════════════════════════════════════════════════════════
 
 from game_logic import Board, parse_request
 
-active_boards:          dict[int, Board] = {}
-board_message_ids:      dict[int, int]   = {}
-remaining_message_ids:  dict[int, int]   = {}
-
+active_boards:         dict[int, Board] = {}
+board_message_ids:     dict[int, int]   = {}
+remaining_message_ids: dict[int, int]   = {}
 
 def get_board(chat_id: int) -> Board:
     if chat_id not in active_boards:
@@ -150,7 +167,7 @@ def get_board(chat_id: int) -> Board:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6. DISPLAY HELPERS
+# 7. DISPLAY HELPERS
 # ══════════════════════════════════════════════════════════════════
 
 def build_board_text(board: Board) -> str:
@@ -204,11 +221,10 @@ def build_board_text(board: Board) -> str:
 
     return "\n".join(lines)
 
-
 def build_remaining_text(board: Board, keyword: str = "ቀሪ") -> str:
-    cfg   = get_game_config()
-    spp   = cfg["slots_per_person"]
-    free  = board.get_free_blocks(include_half=True)
+    cfg  = get_game_config()
+    spp  = cfg["slots_per_person"]
+    free = board.get_free_blocks(include_half=True)
     lines = [keyword]
     for b in free:
         if isinstance(b, int):
@@ -222,7 +238,7 @@ def build_remaining_text(board: Board, keyword: str = "ቀሪ") -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. AI DECISION
+# 8. AI DECIDE (edge case fallback — ሳይቀየር)
 # ══════════════════════════════════════════════════════════════════
 
 def ai_decide(chat_id: int, user_text: str, user_name: str, is_admin: bool) -> dict:
@@ -265,10 +281,6 @@ INSTRUCTIONS:
     "to_block": <number or null>
   }}
 }}
-- For registration: extract block number and half/full from message
-- For payment: extract amount in ETB
-- Reply must match training examples style
-- Keep replies short like training data shows
 """
 
     messages = [{"role": "user", "content": user_text}]
@@ -283,7 +295,7 @@ INSTRUCTIONS:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 8. ACTION EXECUTOR
+# 9. ACTION EXECUTOR (ሳይቀየር)
 # ══════════════════════════════════════════════════════════════════
 
 async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -315,7 +327,6 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await context.bot.send_message(
                 chat_id, build_board_text(board) + "\n\n🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏")
 
-    # ─ REGISTER ─
     if action == "register":
         block   = data.get("block")
         is_half = data.get("is_half", False)
@@ -328,23 +339,19 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
             await update.message.reply_text(reply)
 
-    # ─ PAYMENT ─
     elif action == "payment":
         amount = data.get("amount", 0)
         if amount:
             board.apply_payment(user_name, amount)
         await update.message.reply_text(reply)
 
-    # ─ SHOW BOARD ─
     elif action == "show_board":
         bm = await update.message.reply_text(build_board_text(board))
         board_message_ids[chat_id] = bm.message_id
 
-    # ─ SHOW REMAINING ─
     elif action == "show_remaining":
         await update.message.reply_text(build_remaining_text(board))
 
-    # ─ TRANSFER ─
     elif action == "transfer":
         from_b = data.get("from_block")
         to_b   = data.get("to_block")
@@ -352,7 +359,6 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
             board.transfer(from_b, to_b)
         await update.message.reply_text(reply)
 
-    # ─ CLEAR SLOT ─
     elif action == "clear_slot":
         block = data.get("block")
         if block:
@@ -361,7 +367,6 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 board.slots[start + i].__init__(start + i)
         await update.message.reply_text(reply)
 
-    # ─ NEW GAME ─
     elif action == "new_game":
         active_boards[chat_id] = Board()
         board_message_ids.pop(chat_id, None)
@@ -369,7 +374,6 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(reply)
         await context.bot.send_message(chat_id, build_board_text(active_boards[chat_id]))
 
-    # ─ WINNER ─
     elif action == "winner":
         import random
         taken   = [b for b in range(1, cfg["slots_total"] // cfg["slots_per_person"] + 1)
@@ -389,13 +393,12 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
             lines.append(f"{medals[rank]}: {name} — {prize} ብር")
         await update.message.reply_text("\n".join(lines))
 
-    # ─ UNKNOWN ─
     else:
         await update.message.reply_text(reply)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9. TELEGRAM HANDLERS
+# 10. TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -438,23 +441,44 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin  = user.id in ADMIN_IDS
     text      = update.message.text.strip()
 
-    # ─ Quick parse — ቁጥር ከሆነ directly register (ፈጣን) ─
+    # ── Step 1: parse_request (ቁጥር ከሆነ — ፈጣን) ──────────────────
     parsed = parse_request(text)
     if parsed:
         board = get_board(chat_id)
         cfg   = get_game_config()
+
         for block, is_half, name_override in parsed:
-            name    = name_override or user_name
+            name            = name_override or user_name
             success, reason = board.register(block, name, is_half)
-            free    = board.get_free_blocks()
-            low_th  = cfg["low_slots_threshold"]
+            free            = board.get_free_blocks()
+            low_th          = cfg["low_slots_threshold"]
 
             if success:
-                reply = ("ጨዋታ ተሞልቷል 🙏" if len(free) == 0
-                         else "እሺ ይፍጠን 🙏" if len(free) <= low_th
-                         else "እሺ 🙏 ገቢ")
+                # ── Step 2: vector lookup ⚡ ──────────────────────
+                event_data = {
+                    "event_type": "registration",
+                    "data": {
+                        "block":            block,
+                        "is_half":          is_half,
+                        "partner":          None,
+                        "remaining_blocks": len(free),
+                        "lang":             "am",
+                    }
+                }
+                reply = vector_lookup(event_data)
+
+                # ── Step 3: fallback ──────────────────────────────
+                if not reply:
+                    reply = ("ጨዋታ ተሞልቷል 🙏" if len(free) == 0
+                             else "እሺ ይፍጠን 🙏" if len(free) <= low_th
+                             else "እሺ 🙏 ገቢ")
             else:
-                reply = "ተቀደምክ 🙏" if reason == "taken" else "ይቅርታ 🙏"
+                # taken → vector lookup
+                event_data = {
+                    "event_type": "registration_failed",
+                    "data": {"block": block, "is_half": is_half, "lang": "am"}
+                }
+                reply = vector_lookup(event_data) or "ተቀደምክ 🙏"
 
             await update.message.reply_text(reply)
 
@@ -479,13 +503,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         build_board_text(board) + "\n\n🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏")
         return
 
-    # ─ AI decision — ቁጥር ካልሆነ ─
+    # ── Step 4: AI (edge case) ────────────────────────────────────
     decision = ai_decide(chat_id, text, user_name, is_admin)
     await execute_action(update, context, decision, user_name)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 10. MAIN
+# 11. MAIN
 # ══════════════════════════════════════════════════════════════════
 
 def main():
@@ -503,7 +527,6 @@ def main():
 
     print("🤖 Bot ጀምሯል...")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
