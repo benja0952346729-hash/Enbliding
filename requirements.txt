@@ -10,3 +10,6 @@ pgvector>=0.3.2
 
 # Config
 python-dotenv>=1.0.0
+
+# sentence
+sentence-transformers
