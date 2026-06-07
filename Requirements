@@ -1,0 +1,12 @@
+# Telegram
+python-telegram-bot==21.5
+
+# AI
+openai>=1.40.0
+
+# Database
+psycopg2-binary>=2.9.9
+pgvector>=0.3.2
+
+# Config
+python-dotenv>=1.0.0
