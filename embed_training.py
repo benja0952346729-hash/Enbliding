@@ -76,6 +76,53 @@ TAKEN_REPLIES_EN = [
 ]
 REMAINING_KEYWORDS = ["ቀሪ", "ነቃይ", "remaining", "ቀሪዎች"]
 
+# ─── Missing Patterns ────────────────────────────────────────────
+REMAINING_QUESTIONS_AM = [
+    "ቀሪ", "ቁጥር አለ?", "ምን ቀረ?", "ስንት ቀረ?", "ቁጥሮች አሉ?",
+    "ነቃይ", "ቀሪዎች ስንት ናቸው?", "ምን አለ?", "ያለ ቁጥር?",
+    "ቀሪ ቁጥር ስንት ነው?", "ስንት ቁጥር ቀረ?",
+]
+REMAINING_QUESTIONS_EN = [
+    "remaining", "how many left?", "any slots?", "what's left?",
+    "slots available?", "how many slots remain?", "left?",
+]
+REMAINING_REPLIES_AM = [
+    "ቀሪ ቁጥሮች 👆", "እነዚህ ቀርተዋል 🙏", "ቀሪ 👆",
+    "አሉ 🙏 ቀሪ ቁጥሮች 👆", "ይህን ይመልከቱ 👆",
+]
+REMAINING_REPLIES_EN = [
+    "Remaining slots 👆", "These are left 🙏", "Available 👆",
+]
+
+BOARD_QUESTIONS_AM = [
+    "board ይምጣ", "board አሳይ", "ሰንጠረዥ አሳይ",
+    "ሁሉንም አሳይ", "board ልሳይ", "ሁኔታ ምን ይመስላል?",
+]
+BOARD_QUESTIONS_EN = [
+    "show board", "board please", "show all", "what's the board?",
+]
+BOARD_REPLIES_AM = ["እነሆ 🙏 👆", "ይህ ነው board 🙏 👆", "👆 🙏"]
+BOARD_REPLIES_EN = ["Here it is 🙏 👆", "Board 👆 🙏"]
+
+TRANSFER_REQUESTS_AM = [
+    "{f} ወደ {t} ቀይር", "{f} → {t}", "{f} ን {t} አድርገው",
+    "{f} ቦታ {t} ሂድ", "{f} transfer {t}",
+]
+TRANSFER_REPLIES_AM = ["እሺ ቀየርኩ 🙏", "ተቀይሯል 🙏", "ቀይሬ ነው 🙏"]
+
+CANCEL_REQUESTS_AM = [
+    "{b} ሰርዝ", "{b} አስወግድ", "{b} ያዝ ሰርዝ", "cancel {b}",
+]
+CANCEL_REPLIES_AM  = ["ተሰርዟል 🙏", "እሺ ሰረዝኩ 🙏", "ተወግዷል 🙏"]
+
+HAS_SLOTS_REPLIES_AM = [
+    "አለ 🙏 ብዙ ቁጥሮች አሉ", "አሉ 🙏", "አለ ፈጠን 🙏",
+    "አሁንም አለ 🙏 ፈጠን", "አለ ብዙ 🙏",
+]
+HAS_SLOTS_REPLIES_EN = [
+    "Yes available 🙏", "Slots available 🙏", "Yes hurry 🙏",
+]
+
 # ─── Amharic Numbers ─────────────────────────────────────────────
 AMHARIC_NUMBERS = {
     1: "አንድ", 2: "ሁለት", 3: "ሶስት", 4: "አራት", 5: "አምስት",
@@ -229,6 +276,26 @@ def format_event_content(event_type: str, data: dict) -> str:
         return f"board remaining trigger low slots free: {data.get('free_count')}"
     elif event_type == "new_game":
         return f"new game started: {data.get('bot_message', '')}"
+    elif event_type == "remaining_query":
+        return (
+            f"user: {data.get('user_request', '')} "
+            f"remaining: {data.get('remaining_blocks', 0)} "
+            f"reply: {data.get('bot_reply', '')}"
+        )
+    elif event_type == "board_query":
+        return f"user: {data.get('user_request', '')} reply: {data.get('bot_reply', '')}"
+    elif event_type == "transfer":
+        return (
+            f"user: {data.get('user_request', '')} "
+            f"from: {data.get('from_block')} to: {data.get('to_block')} "
+            f"reply: {data.get('bot_reply', '')}"
+        )
+    elif event_type == "cancel":
+        return (
+            f"user: {data.get('user_request', '')} "
+            f"block: {data.get('block')} "
+            f"reply: {data.get('bot_reply', '')}"
+        )
     else:
         return json.dumps(data, ensure_ascii=False)[:300]
 
@@ -309,7 +376,8 @@ def get_reply_from_event(event: dict) -> str:
     elif etype in ("unpaid_warning", "winner", "new_game",
                    "all_paid_board", "board_with_remaining"):
         return data.get("bot_message", "")
-    return ""
+    elif etype in ("remaining_query", "board_query", "transfer", "cancel"):
+        return data.get("bot_reply", "")
 
 
 # ─── Simulate 1 Game ─────────────────────────────────────────────
@@ -403,7 +471,72 @@ def simulate_game(game_id):
 
         now += timedelta(minutes=random.randint(1, 10))
 
-    # Payment
+    # ── Missing Patterns — Remaining questions ───────────────────
+    for _ in range(random.randint(2, 5)):
+        lang      = random.choice(["am", "en"])
+        free      = board.get_free_blocks()
+        remaining = len(free)
+
+        if lang == "am":
+            user_req = random.choice(REMAINING_QUESTIONS_AM)
+            if remaining > cfg["low_slots_threshold"]:
+                bot_reply = random.choice(HAS_SLOTS_REPLIES_AM)
+            else:
+                bot_reply = random.choice(REMAINING_REPLIES_AM)
+        else:
+            user_req  = random.choice(REMAINING_QUESTIONS_EN)
+            bot_reply = random.choice(REMAINING_REPLIES_EN) if remaining <= cfg["low_slots_threshold"] else random.choice(HAS_SLOTS_REPLIES_EN)
+
+        log("remaining_query", {
+            "user_request":     user_req,
+            "bot_reply":        bot_reply,
+            "remaining_blocks": remaining,
+            "lang":             lang,
+        })
+        now += timedelta(minutes=random.randint(1, 5))
+
+    # ── Missing Patterns — Board questions ───────────────────────
+    for _ in range(random.randint(1, 3)):
+        lang     = random.choice(["am", "en"])
+        user_req = random.choice(BOARD_QUESTIONS_AM if lang == "am" else BOARD_QUESTIONS_EN)
+        reply    = random.choice(BOARD_REPLIES_AM if lang == "am" else BOARD_REPLIES_EN)
+        log("board_query", {
+            "user_request": user_req,
+            "bot_reply":    reply,
+            "lang":         lang,
+        })
+        now += timedelta(minutes=random.randint(1, 5))
+
+    # ── Missing Patterns — Transfer ──────────────────────────────
+    taken_blocks = [b for b in range(1, total_blocks + 1) if not board.is_block_free(b)]
+    free_blocks  = board.get_free_blocks()
+    if taken_blocks and free_blocks and random.random() < 0.3:
+        f        = random.choice(taken_blocks)
+        t        = random.choice([b for b in free_blocks if isinstance(b, int)])
+        user_req = random.choice(TRANSFER_REQUESTS_AM).format(f=f*cfg["slots_per_person"]-cfg["slots_per_person"]+1, t=t*cfg["slots_per_person"]-cfg["slots_per_person"]+1)
+        reply    = random.choice(TRANSFER_REPLIES_AM)
+        log("transfer", {
+            "user_request": user_req,
+            "bot_reply":    reply,
+            "from_block":   f,
+            "to_block":     t,
+            "lang":         "am",
+        })
+        now += timedelta(minutes=random.randint(1, 5))
+
+    # ── Missing Patterns — Cancel ─────────────────────────────────
+    if taken_blocks and random.random() < 0.2:
+        b        = random.choice(taken_blocks)
+        slot_num = b * cfg["slots_per_person"] - cfg["slots_per_person"] + 1
+        user_req = random.choice(CANCEL_REQUESTS_AM).format(b=slot_num)
+        reply    = random.choice(CANCEL_REPLIES_AM)
+        log("cancel", {
+            "user_request": user_req,
+            "bot_reply":    reply,
+            "block":        b,
+            "lang":         "am",
+        })
+        now += timedelta(minutes=random.randint(1, 5))
     for num, slot in board.slots.items():
         if not slot.is_taken:
             continue
