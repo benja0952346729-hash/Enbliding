@@ -1,28 +1,417 @@
-import os
+import random
 import json
-import time
 import psycopg2
 import psycopg2.extras
-from openai import OpenAI
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from config import get_game_config, DATABASE_URL
+from game_logic import Board
 
-load_dotenv(override=True)
+# ── Lazy load sentence-transformers ──────────────────────────────
+_embed_model = None
 
-DATABASE_URL   = os.getenv("DATABASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-EMBED_MODEL    = "text-embedding-3-small"
-BATCH_SIZE     = 100  # OpenAI ላይ በ batch ይልካል
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        print("📥 Model loading... (አንድ ጊዜ ብቻ)")
+        _embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        print("✅ Model ready!")
+    return _embed_model
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+cfg = get_game_config()
 
-# ══════════════════════════════════════════════════════════════════
-# 1. DB SETUP — pgvector extension + table
-# ══════════════════════════════════════════════════════════════════
+# ─── Sample Names ────────────────────────────────────────────────
+AMHARIC_NAMES = [
+    "አበበ", "አየለ", "ከበደ", "አልማዝ", "ሰላም", "ብርሃን", "ዮሃንስ", "ሄኖክ",
+    "ናትናኤል", "ሚካኤል", "ሩት", "ማርያም", "ፍቅር", "ተወልደ", "ዳዊት", "ሳሙኤል",
+    "እስቲፋኖስ", "ቤዛዊት", "ሙሉወርቅ", "ትዕግስት", "ፀጋዬ", "ገብሩ", "አስቴር",
+    "ሕይወት", "ዘሪቱ", "ቃልኪዳን", "ኤፍሬም", "ቢኒያም", "ስምረት", "ዲና",
+    "ፍሬሕይወት", "ወርቅነሽ", "ምህረት", "አሰፋ", "ግርማ", "ታደሰ", "ሙሉጌታ",
+    "ሸዋዬ", "አስናቀ", "ደሳለኝ", "ጌታቸው", "አዱኛ", "ክብሮም", "ሃይሌ",
+    "ልዕልት", "ትርሃስ", "አምሃ", "ጥላሁን", "ዘነበ", "ንጉሴ"
+]
+ENGLISH_NAMES = [
+    "Abel", "Yonas", "Miki", "Sara", "Helen", "Biruk", "Nati", "Sam",
+    "John", "Mary", "Alex", "Liya", "Eden", "Soli", "Bini", "Tina",
+    "Roli", "Hana", "Dani", "Meron", "Sami", "Kidus", "Naol", "Femi",
+    "Tsion", "Lidya", "Selam", "Ermias", "Fitsum", "Bereket"
+]
+ALL_NAMES = AMHARIC_NAMES + ENGLISH_NAMES
 
-def setup_vector_db():
-    print("📦 pgvector setup...")
-    conn = psycopg2.connect(DATABASE_URL)
+# ─── Request Styles ──────────────────────────────────────────────
+HALF_KEYWORDS_AM = ["+", "÷", "ግ", "ግማሽ", "በግማሽ", "gmash", "gm", "g", "half"]
+HALF_KEYWORDS_EN = ["+", "g", "gm", "gmash", "half"]
+
+REGISTRATION_REPLIES_AM = [
+    "እሺ 🙏 ገቢ", "ቤተሰብ ገቢ 🙏", "ገቢ እንዳይረሳ 🙏",
+    "እሺ 🙏", "ገቢ 🙏", "ተቀበልን 🙏", "እሺ ይፍጠን 🙏",
+]
+REGISTRATION_REPLIES_EN = [
+    "Done 🙏 registered", "Got it 🙏", "Registered 🙏",
+    "OK 🙏", "Done 🙏",
+]
+
+TAKEN_REPLIES_AM = [
+    "ተቀደምክ 🙏", "ተይዟል ይቅርታ 🙏", "ተቀድሟል 🙏",
+    "ይህ ቁጥር ተወስዷል 🙏", "ቀድሞ ተወስዷል 🙏",
+]
+TAKEN_REPLIES_EN = [
+    "Already taken 🙏", "Sorry, taken 🙏", "That number is taken 🙏",
+]
+
+REMAINING_KEYWORDS = ["ቀሪ", "ነቃይ", "remaining", "ቀሪዎች"]
+
+def random_half_keyword(lang="am"):
+    if lang == "en":
+        return random.choice(HALF_KEYWORDS_EN)
+    return random.choice(HALF_KEYWORDS_AM)
+
+def format_block_request(block, is_half, lang="am"):
+    kw = random_half_keyword(lang) if is_half else ""
+    if lang == "en":
+        styles = [
+            f"{block:02d}{kw}", f"{block}{kw}",
+            f"{block} take", f"give me {block}",
+            f"block {block}", f"I want {block}",
+            f"{block:02d} please", f"register {block}",
+        ]
+        if is_half:
+            styles += [
+                f"{block} half", f"{block:02d} half",
+                f"{block} g", f"{block} gm",
+            ]
+    else:
+        styles = [
+            f"{block:02d}{kw}", f"{block}{kw}",
+            f"{block} ያዝ", f"{block:02d} ያዝ",
+            f"{block} ይያዝ", f"{block:02d} ይያዝ",
+            f"{block} ቁጥር ያዝ", f"0{block}" if block < 10 else f"{block}",
+        ]
+        if is_half:
+            styles += [
+                f"{block} ግማሽ", f"{block:02d} ግማሽ",
+                f"{block}+", f"{block:02d}+",
+                f"{block} በግማሽ", f"{block} ÷",
+            ]
+    return random.choice(styles)
+
+# ─── Board Display ───────────────────────────────────────────────
+def get_block_start(block_number, slots_per_person):
+    return (block_number - 1) * slots_per_person + 1
+
+def build_board_header(cfg):
+    spp   = cfg["slots_per_person"]
+    total = cfg["slots_total"]
+    users = total // spp
+    pf    = cfg["price_full"]
+    ph    = cfg["price_half"]
+    p1    = cfg["prize_1st"]
+    p2    = cfg["prize_2nd"]
+    p3    = cfg["prize_3rd"]
+    return (
+        f"በ {pf} ብር {spp} ቁጥሮችን በተከታታይ በመያዝ እድሎን ይሞክሩ "
+        f"ለ {users} ሰው ብቻ ፈጣን ዕድል መልካም ዕድል\n\n"
+        f"መደብ 👉በ {pf} ብር \n"
+        f"       👉ግማሽ {ph} ብር \n\n"
+        f"1ኛ 🥇{p1} ብር \n2ኛ 🥈{p2}\n3ኛ 🥉{p3}\n"
+    )
+
+def build_board_footer(cfg):
+    lines = []
+    if cfg.get("cbe_account"):
+        lines.append(f"CBE {cfg['cbe_account']} {cfg.get('cbe_name','')}")
+    if cfg.get("awash_account"):
+        lines.append(f"አዋሽ  {cfg['awash_account']}")
+    if cfg.get("dashen_account"):
+        lines.append(f"ዳሽን  {cfg['dashen_account']}")
+    if cfg.get("tele_birr"):
+        lines.append(f"ቴሌ ብር {cfg['tele_birr']}")
+    return "\n".join(lines)
+
+def display_board(board):
+    cfg   = get_game_config()
+    spp   = cfg["slots_per_person"]
+    total = cfg["slots_total"]
+    lines = [build_board_header(cfg)]
+    for i in range(1, total + 1):
+        slot        = board.slots[i]
+        block_start = ((i - 1) // spp) * spp + 1
+        if i == block_start and slot.name:
+            mark     = "✅" if slot.paid_main  else ""
+            reminder = "❓" if slot.reminder   else ""
+            if slot.partner:
+                pmark = "✅" if slot.paid_partner else ""
+                lines.append(f"{i:02d}# {slot.name}{mark}{reminder}+ {slot.partner}{pmark}")
+            elif slot.is_half:
+                lines.append(f"{i:02d}# {slot.name}{mark}{reminder}+")
+            else:
+                lines.append(f"{i:02d}# {slot.name}{mark}{reminder}")
+        else:
+            lines.append(f"{i:02d}#")
+        if i % spp == 0 and i < total:
+            lines.append("")
+    lines.append("")
+    lines.append(build_board_footer(cfg))
+    return "\n".join(lines)
+
+def display_remaining(free_blocks, slots_per_person, keyword="ቀሪ"):
+    lines = [keyword]
+    for b in free_blocks:
+        if isinstance(b, int):
+            start = get_block_start(b, slots_per_person)
+            lines.append(f"{start:02d}")
+        else:
+            b_num = int(str(b).replace("+", ""))
+            start = get_block_start(b_num, slots_per_person)
+            lines.append(f"{start:02d}+")
+    return "\n".join(lines)
+
+# ─── Event Content Formatter ─────────────────────────────────────
+def format_event_content(event_type: str, data: dict) -> str:
+    """Event → searchable text string"""
+    if event_type == "registration":
+        return (
+            f"user: {data.get('user_request', '')} "
+            f"block: {data.get('block')} "
+            f"name: {data.get('name', '')} "
+            f"half: {data.get('is_half', False)} "
+            f"reply: {data.get('bot_reply', '')}"
+        )
+    elif event_type == "registration_failed":
+        return (
+            f"block: {data.get('block')} taken "
+            f"reply: {data.get('bot_reply', '')}"
+        )
+    elif event_type == "payment":
+        return (
+            f"payment name: {data.get('name', '')} "
+            f"amount: {data.get('amount', 0)} "
+            f"reply: {data.get('bot_reply', '')}"
+        )
+    elif event_type == "unpaid_warning":
+        return (
+            f"unpaid warning blocks: {data.get('unpaid_blocks', [])} "
+            f"message: {data.get('bot_message', '')}"
+        )
+    elif event_type == "winner":
+        return (
+            f"winner rank: {data.get('rank')} "
+            f"name: {data.get('name', '')} "
+            f"prize: {data.get('prize', 0)} "
+            f"message: {data.get('bot_message', '')}"
+        )
+    elif event_type == "board_with_remaining":
+        return f"board remaining trigger low slots free: {data.get('free_count')}"
+    elif event_type == "new_game":
+        return f"new game started: {data.get('bot_message', '')}"
+    else:
+        return json.dumps(data, ensure_ascii=False)[:300]
+
+# ─── Simulate 1 Game ─────────────────────────────────────────────
+def simulate_game(game_id):
+    board  = Board()
+    events = []
+    cfg    = get_game_config()
+    now    = datetime(2024, 1, 1) + timedelta(days=random.randint(0, 365))
+    spp    = cfg["slots_per_person"]
+
+    total_blocks = cfg["slots_total"] // spp
+    used_names   = []
+    msg_count    = 0
+    board_active = False
+
+    def log(event_type, data):
+        events.append({
+            "game_id":    game_id,
+            "event_type": event_type,
+            "data":       data,
+            "timestamp":  now.isoformat(),
+            "content":    format_event_content(event_type, data),
+        })
+
+    # ── 1. Registration ──────────────────────────────────────────
+    blocks = list(range(1, total_blocks + 1))
+    random.shuffle(blocks)
+
+    for block in blocks:
+        name    = random.choice(ALL_NAMES)
+        lang    = "en" if name in ENGLISH_NAMES else "am"
+        is_half = random.random() < 0.25
+
+        if used_names and random.random() < 0.1:
+            name = random.choice(used_names)
+
+        partner = None
+        if is_half and random.random() < 0.5:
+            partner = random.choice(ALL_NAMES)
+
+        success, reason = board.register(block, name, is_half, partner)
+
+        if success:
+            used_names.append(name)
+            req         = format_block_request(block, is_half, lang)
+            free_blocks = board.get_free_blocks()
+            remaining   = len(free_blocks)
+
+            if remaining == 0:
+                bot_reply = "ጨዋታ ተሞልቷል 🙏" if lang == "am" else "Game is full 🙏"
+            elif remaining <= cfg["low_slots_threshold"]:
+                bot_reply = "እሺ ይፍጠን 🙏" if lang == "am" else "Hurry up! 🙏"
+            else:
+                bot_reply = random.choice(REGISTRATION_REPLIES_AM) if lang == "am" \
+                            else random.choice(REGISTRATION_REPLIES_EN)
+
+            log("registration", {
+                "user_request": req, "block": block,
+                "name": name, "is_half": is_half,
+                "partner": partner, "bot_reply": bot_reply,
+                "lang": lang, "remaining_blocks": remaining,
+            })
+
+            msg_count += 1
+            keyword = random.choice(REMAINING_KEYWORDS)
+
+            if remaining == cfg["low_slots_threshold"]:
+                board_active = True
+                msg_count    = 0
+                log("board_with_remaining", {
+                    "trigger":           "low_slots",
+                    "board":             display_board(board),
+                    "remaining":         display_remaining(free_blocks, spp, keyword),
+                    "remaining_keyword": keyword,
+                    "free_count":        remaining,
+                    "bot_action":        "send_board_and_remaining",
+                })
+            elif board_active:
+                log("remaining_update", {
+                    "trigger":           "slot_taken",
+                    "remaining":         display_remaining(free_blocks, spp, keyword),
+                    "remaining_keyword": keyword,
+                    "bot_action":        "delete_old_remaining_send_new",
+                })
+                if msg_count >= 4:
+                    msg_count = 0
+                    log("board_move", {
+                        "trigger":    "4_messages",
+                        "board":      display_board(board),
+                        "remaining":  display_remaining(free_blocks, spp, keyword),
+                        "bot_action": "delete_old_board_send_new",
+                    })
+        else:
+            reply = random.choice(TAKEN_REPLIES_AM) if random.random() < 0.7 \
+                    else random.choice(TAKEN_REPLIES_EN)
+            log("registration_failed", {
+                "block": block, "reason": reason, "bot_reply": reply,
+            })
+
+        now += timedelta(minutes=random.randint(1, 10))
+
+    # ── 2. Payment ───────────────────────────────────────────────
+    for num, slot in board.slots.items():
+        if not slot.is_taken:
+            continue
+        blk = (num - 1) // spp + 1
+        if num != board.get_block_start(blk):
+            continue
+        if random.random() < 0.8:
+            amount = cfg["price_half"] if slot.is_half else cfg["price_full"]
+            if slot.partner and random.random() < 0.5:
+                amount = cfg["price_half"]
+            updated, rem = board.apply_payment(slot.name, amount)
+            log("payment", {
+                "name": slot.name, "amount": amount,
+                "updated_slots": updated, "remaining_balance": rem,
+                "bot_reply": f"{slot.name} ✅ ገቢ 🙏" if rem == 0
+                             else f"{slot.name} {rem}ብር ቀርቷል ጨምር 🙏",
+            })
+        now += timedelta(minutes=random.randint(1, 5))
+
+    # ── 3. Unpaid Warning ─────────────────────────────────────────
+    unpaid = board.get_unpaid_blocks()
+    if unpaid:
+        log("unpaid_warning", {
+            "unpaid_blocks": unpaid,
+            "bot_message":   "⚠️ 2 ደቂቃ ይቀራል! ያልከፈሉ:\n" + "\n".join(unpaid),
+        })
+        for b_str in unpaid:
+            b     = int(b_str.replace("+", ""))
+            start = board.get_block_start(b)
+            slot  = board.slots[start]
+            if random.random() < 0.6:
+                amount = cfg["price_half"] if "+" in b_str else cfg["price_full"]
+                board.apply_payment(slot.name, amount)
+                log("late_payment", {"block": b, "name": slot.name, "amount": amount})
+            else:
+                for i in range(spp):
+                    board.slots[start + i].__init__(start + i)
+                log("slot_removed", {"block": b, "reason": "unpaid timeout"})
+        now += timedelta(minutes=2)
+
+    # ── 4. Final Board ───────────────────────────────────────────
+    log("all_paid_board", {
+        "board":       display_board(board),
+        "bot_message": "🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏",
+        "bot_action":  "send_final_board_keep_forever",
+    })
+
+    # ── 5. Winner ────────────────────────────────────────────────
+    taken    = [b for b in range(1, total_blocks+1) if not board.is_block_free(b)]
+    w_count  = min(cfg["winners_count"], len(taken))
+    w_blocks = random.sample(taken, w_count)
+    prizes   = [cfg["prize_1st"], cfg["prize_2nd"], cfg["prize_3rd"]]
+    medals   = ["🥇 1ኛ", "🥈 2ኛ", "🥉 3ኛ"]
+    w_names  = []
+
+    for rank, blk in enumerate(w_blocks):
+        start = board.get_block_start(blk)
+        name  = board.slots[start].name
+        prize = prizes[rank] if rank < len(prizes) else 0
+        w_names.append(name)
+        log("winner", {
+            "rank": rank+1, "block": blk, "name": name, "prize": prize,
+            "bot_message": f"{medals[rank]}: {name} — {prize}ብር",
+        })
+
+    # ── 6. Winner Balance ─────────────────────────────────────────
+    for rank, (blk, name) in enumerate(zip(w_blocks, w_names)):
+        prize   = prizes[rank] if rank < len(prizes) else 0
+        sent    = (random.randint(0, prize) // cfg["price_half"]) * cfg["price_half"]
+        updated, removed, balance = board.apply_winner_balance(name, prize, sent)
+        log("winner_balance", {
+            "name": name, "prize": prize,
+            "admin_sent": sent, "balance": balance,
+            "auto_approved": updated, "auto_removed": removed,
+            "admin_message": f"{rank+1}={sent}",
+        })
+
+    # ── 7. New Game ───────────────────────────────────────────────
+    log("new_game", {
+        "bot_message": "🎰 አዲስ ጨዋታ ተጀምሯል! መልካም ዕድል 🙏",
+        "bot_action":  "send_new_empty_board",
+    })
+
+    return events
+
+# ─── Database ────────────────────────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+def setup_db():
+    print("📦 DB setup...")
+    conn = get_conn()
     cur  = conn.cursor()
+
+    # Training events table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS training_events (
+            id         SERIAL PRIMARY KEY,
+            game_id    INTEGER,
+            event_type TEXT,
+            data       JSONB,
+            content    TEXT,
+            timestamp  TIMESTAMP
+        )
+    """)
 
     # pgvector extension
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
@@ -34,11 +423,11 @@ def setup_vector_db():
             event_id   INTEGER REFERENCES training_events(id),
             event_type TEXT,
             content    TEXT,
-            embedding  vector(1536)
-        );
+            embedding  vector(384)
+        )
     """)
 
-    # Index — fast similarity search
+    # Index for fast search
     cur.execute("""
         CREATE INDEX IF NOT EXISTS embedding_idx
         ON training_embeddings
@@ -46,224 +435,100 @@ def setup_vector_db():
         WITH (lists = 100);
     """)
 
+    # Truncate old data
+    cur.execute("TRUNCATE TABLE training_embeddings RESTART IDENTITY;")
+    cur.execute("TRUNCATE TABLE training_events RESTART IDENTITY CASCADE;")
+
     conn.commit()
     cur.close()
     conn.close()
-    print("✅ pgvector ready!")
+    print("✅ DB ready!")
 
-
-# ══════════════════════════════════════════════════════════════════
-# 2. EVENT → TEXT — embedding ለማድረግ readable text
-# ══════════════════════════════════════════════════════════════════
-
-def event_to_text(event_type: str, data: dict) -> str:
-    """
-    Event data → single string ያደርጋል።
-    AI ተምሮበት ያለውን format ይጠቀማል።
-    """
-    parts = [f"event: {event_type}"]
-
-    # Registration
-    if event_type == "registration":
-        req    = data.get("user_request", "")
-        name   = data.get("name", "")
-        block  = data.get("block", "")
-        half   = "ግማሽ" if data.get("is_half") else "ሙሉ"
-        reply  = data.get("bot_reply", "")
-        parts += [
-            f"user: {req}",
-            f"name: {name}",
-            f"block: {block}",
-            f"type: {half}",
-            f"bot: {reply}",
-        ]
-
-    # Payment
-    elif event_type == "payment":
-        name   = data.get("name", "")
-        amount = data.get("amount", "")
-        reply  = data.get("bot_reply", "")
-        parts += [
-            f"name: {name}",
-            f"amount: {amount}",
-            f"bot: {reply}",
-        ]
-
-    # Unpaid warning
-    elif event_type == "unpaid_warning":
-        blocks  = data.get("unpaid_blocks", [])
-        message = data.get("bot_message", "")
-        parts  += [
-            f"unpaid: {', '.join(blocks)}",
-            f"bot: {message}",
-        ]
-
-    # Winner
-    elif event_type == "winner":
-        name   = data.get("name", "")
-        rank   = data.get("rank", "")
-        prize  = data.get("prize", "")
-        msg    = data.get("bot_message", "")
-        parts += [
-            f"winner: {name}",
-            f"rank: {rank}",
-            f"prize: {prize}",
-            f"bot: {msg}",
-        ]
-
-    # Board events
-    elif event_type in ("board_with_remaining", "board_move", "all_paid_board"):
-        action  = data.get("bot_action", "")
-        trigger = data.get("trigger", "")
-        parts  += [
-            f"trigger: {trigger}",
-            f"action: {action}",
-        ]
-
-    # Registration failed
-    elif event_type == "registration_failed":
-        block  = data.get("block", "")
-        reason = data.get("reason", "")
-        reply  = data.get("bot_reply", "")
-        parts += [
-            f"block: {block}",
-            f"reason: {reason}",
-            f"bot: {reply}",
-        ]
-
-    # New game
-    elif event_type == "new_game":
-        parts += [f"bot: {data.get('bot_message', '')}"]
-
-    # Slot removed
-    elif event_type == "slot_removed":
-        parts += [
-            f"block: {data.get('block', '')}",
-            f"reason: {data.get('reason', '')}",
-        ]
-
-    # Winner balance
-    elif event_type == "winner_balance":
-        parts += [
-            f"name: {data.get('name', '')}",
-            f"prize: {data.get('prize', '')}",
-            f"sent: {data.get('admin_sent', '')}",
-            f"balance: {data.get('balance', '')}",
-        ]
-
-    # Fallback — ሁሉም keys
-    else:
-        for k, v in data.items():
-            if isinstance(v, (str, int, float)):
-                parts.append(f"{k}: {v}")
-
-    return " | ".join(parts)
-
-
-# ══════════════════════════════════════════════════════════════════
-# 3. EMBED BATCH — OpenAI API
-# ══════════════════════════════════════════════════════════════════
-
-def embed_texts(texts: list) -> list:
-    """texts list → embeddings list"""
-    try:
-        resp = client.embeddings.create(
-            model=EMBED_MODEL,
-            input=texts,
-        )
-        return [item.embedding for item in resp.data]
-    except Exception as e:
-        print(f"❌ Embedding error: {e}")
-        time.sleep(5)
+def save_events(events):
+    if not events:
         return []
-
-
-# ══════════════════════════════════════════════════════════════════
-# 4. SAVE EMBEDDINGS → DB
-# ══════════════════════════════════════════════════════════════════
-
-def save_embeddings(rows: list):
-    """rows: list of (event_id, event_type, content, embedding)"""
-    if not rows:
-        return
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = get_conn()
     cur  = conn.cursor()
+
+    rows = [
+        (e["game_id"], e["event_type"],
+         json.dumps(e["data"], ensure_ascii=False),
+         e.get("content", ""),
+         e["timestamp"])
+        for e in events
+    ]
+
     psycopg2.extras.execute_values(
         cur,
-        """
-        INSERT INTO training_embeddings (event_id, event_type, content, embedding)
-        VALUES %s
-        ON CONFLICT DO NOTHING
-        """,
-        [(r[0], r[1], r[2], r[3]) for r in rows],
+        """INSERT INTO training_events
+           (game_id, event_type, data, content, timestamp)
+           VALUES %s RETURNING id""",
+        rows
+    )
+    ids = [r[0] for r in cur.fetchall()]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return ids
+
+def save_embeddings(event_ids, events, embeddings):
+    if not event_ids:
+        return
+    conn = get_conn()
+    cur  = conn.cursor()
+
+    rows = []
+    for eid, event, emb in zip(event_ids, events, embeddings):
+        rows.append((
+            eid,
+            event["event_type"],
+            event.get("content", ""),
+            emb.tolist(),
+        ))
+
+    psycopg2.extras.execute_values(
+        cur,
+        """INSERT INTO training_embeddings
+           (event_id, event_type, content, embedding)
+           VALUES %s""",
+        rows
     )
     conn.commit()
     cur.close()
     conn.close()
 
+# ─── Main ────────────────────────────────────────────────────────
+def run_training(num_games=5000):
+    print(f"🚀 Training ጀምሯል — {num_games} games...")
+    setup_db()
 
-# ══════════════════════════════════════════════════════════════════
-# 5. MAIN — ሁሉም events embed ያደርጋል
-# ══════════════════════════════════════════════════════════════════
+    model        = get_embed_model()
+    total_events = 0
+    CHUNK        = 50  # 50 games per batch
 
-def run_embedding():
-    print("🚀 Embedding ጀምሯል...")
-    setup_vector_db()
+    for game_id in range(1, num_games + 1):
+        chunk_events = simulate_game(game_id)
 
-    conn = psycopg2.connect(DATABASE_URL)
-    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # 1. Save events → get IDs
+        event_ids = save_events(chunk_events)
 
-    # Already embedded events ይዝለላል
-    cur.execute("""
-        SELECT te.id, te.event_type, te.data
-        FROM training_events te
-        LEFT JOIN training_embeddings emb ON te.id = emb.event_id
-        WHERE emb.event_id IS NULL
-        ORDER BY te.id
-    """)
-    events = cur.fetchall()
-    cur.close()
-    conn.close()
+        # 2. Embed contents
+        contents   = [e.get("content", "") for e in chunk_events]
+        embeddings = model.encode(contents, batch_size=64, show_progress_bar=False)
 
-    total = len(events)
-    if total == 0:
-        print("✅ ሁሉም events already embedded ነው!")
-        return
+        # 3. Save embeddings
+        save_embeddings(event_ids, chunk_events, embeddings)
 
-    print(f"📊 {total} events embed ያደርጋል...")
+        total_events += len(chunk_events)
 
-    done = 0
-    for i in range(0, total, BATCH_SIZE):
-        batch  = events[i: i + BATCH_SIZE]
-        texts  = []
-        meta   = []
+        if game_id % CHUNK == 0:
+            pct = int(game_id / num_games * 100)
+            print(f"✅ {game_id}/{num_games} ({pct}%) — {total_events} events embedded", flush=True)
 
-        for e in batch:
-            data    = e["data"] if isinstance(e["data"], dict) else json.loads(e["data"])
-            content = event_to_text(e["event_type"], data)
-            texts.append(content)
-            meta.append((e["id"], e["event_type"], content))
-
-        embeddings = embed_texts(texts)
-        if not embeddings:
-            print(f"⚠️  Batch {i} failed — skipping")
-            continue
-
-        rows = [
-            (meta[j][0], meta[j][1], meta[j][2], embeddings[j])
-            for j in range(len(embeddings))
-        ]
-        save_embeddings(rows)
-
-        done += len(batch)
-        pct   = int(done / total * 100)
-        print(f"✅ {done}/{total} ({pct}%)", flush=True)
-
-        # Rate limit avoid
-        time.sleep(0.5)
-
-    print(f"\n🎉 ተጠናቋል! {done} events → pgvector DB")
-
+    print(f"\n🎉 ተጠናቋል!")
+    print(f"   Games:  {num_games}")
+    print(f"   Events: {total_events}")
+    print(f"   ⏰ {datetime.now().strftime('%H:%M:%S')}")
 
 if __name__ == "__main__":
-    run_embedding()
+    run_training(5000)
