@@ -3,20 +3,40 @@ import json
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
-from config import get_game_config, DATABASE_URL
+from openai import OpenAI
+from config import get_game_config, DATABASE_URL, get_api_key, rotate_key, BASE_URL
 from game_logic import Board
 
-# ── Lazy load sentence-transformers ──────────────────────────────
-_embed_model = None
+# ── Embedding Client ─────────────────────────────────────────────
+# .env ላይ AI_BASE_URL እና AI_API_KEY_1 ብቻ ቀይር
+# NVIDIA:   AI_BASE_URL=https://integrate.api.nvidia.com/v1
+#           EMBED_MODEL=nvidia/nv-embedqa-e5-v5
+# OpenAI:   AI_BASE_URL=https://api.openai.com/v1
+#           EMBED_MODEL=text-embedding-3-small
+# Groq:     Groq embedding የለም → OpenAI ተጠቀም
 
-def get_embed_model():
-    global _embed_model
-    if _embed_model is None:
-        from sentence_transformers import SentenceTransformer
-        print("📥 Model loading... (አንድ ጊዜ ብቻ)")
-        _embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-        print("✅ Model ready!")
-    return _embed_model
+import os
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+
+def get_client():
+    return OpenAI(
+        api_key=get_api_key(),
+        base_url=BASE_URL,
+    )
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """texts → embeddings (rotation ይሠራል)"""
+    while True:
+        try:
+            client = get_client()
+            resp   = client.embeddings.create(
+                model=EMBED_MODEL,
+                input=texts,
+            )
+            return [r.embedding for r in resp.data]
+        except Exception as e:
+            print(f"⚠️ Key error: {e} — rotating...")
+            rotate_key()
 
 cfg = get_game_config()
 
@@ -50,7 +70,6 @@ REGISTRATION_REPLIES_EN = [
     "Done 🙏 registered", "Got it 🙏", "Registered 🙏",
     "OK 🙏", "Done 🙏",
 ]
-
 TAKEN_REPLIES_AM = [
     "ተቀደምክ 🙏", "ተይዟል ይቅርታ 🙏", "ተቀድሟል 🙏",
     "ይህ ቁጥር ተወስዷል 🙏", "ቀድሞ ተወስዷል 🙏",
@@ -58,16 +77,24 @@ TAKEN_REPLIES_AM = [
 TAKEN_REPLIES_EN = [
     "Already taken 🙏", "Sorry, taken 🙏", "That number is taken 🙏",
 ]
-
 REMAINING_KEYWORDS = ["ቀሪ", "ነቃይ", "remaining", "ቀሪዎች"]
 
+# ─── Amharic Numbers (ለ training data) ───────────────────────────
+AMHARIC_NUMBERS = {
+    1: "አንድ", 2: "ሁለት", 3: "ሶስት", 4: "አራት", 5: "አምስት",
+    6: "ስድስት", 7: "ሰባት", 8: "ስምንት", 9: "ዘጠኝ", 10: "አስር",
+    11: "አስራ አንድ", 12: "አስራ ሁለት", 13: "አስራ ሶስት", 14: "አስራ አራት",
+    15: "አስራ አምስት", 16: "አስራ ስድስት", 17: "አስራ ሰባት", 18: "አስራ ስምንት",
+    19: "አስራ ዘጠኝ", 20: "ሃያ",
+}
+
 def random_half_keyword(lang="am"):
-    if lang == "en":
-        return random.choice(HALF_KEYWORDS_EN)
-    return random.choice(HALF_KEYWORDS_AM)
+    return random.choice(HALF_KEYWORDS_EN if lang == "en" else HALF_KEYWORDS_AM)
 
 def format_block_request(block, is_half, lang="am"):
-    kw = random_half_keyword(lang) if is_half else ""
+    kw      = random_half_keyword(lang) if is_half else ""
+    am_num  = AMHARIC_NUMBERS.get(block, "")
+
     if lang == "en":
         styles = [
             f"{block:02d}{kw}", f"{block}{kw}",
@@ -76,17 +103,23 @@ def format_block_request(block, is_half, lang="am"):
             f"{block:02d} please", f"register {block}",
         ]
         if is_half:
-            styles += [
-                f"{block} half", f"{block:02d} half",
-                f"{block} g", f"{block} gm",
-            ]
+            styles += [f"{block} half", f"{block:02d} half", f"{block} g", f"{block} gm"]
     else:
         styles = [
             f"{block:02d}{kw}", f"{block}{kw}",
             f"{block} ያዝ", f"{block:02d} ያዝ",
             f"{block} ይያዝ", f"{block:02d} ይያዝ",
-            f"{block} ቁጥር ያዝ", f"0{block}" if block < 10 else f"{block}",
+            f"{block} ቁጥር ያዝ",
         ]
+        # አማርኛ ቁጥር ጨምር
+        if am_num:
+            styles += [
+                f"{am_num} ያዝ", f"{am_num}",
+                f"{am_num} ቁጥር",
+            ]
+            if is_half:
+                styles += [f"{am_num} ግማሽ", f"{am_num}+"]
+
         if is_half:
             styles += [
                 f"{block} ግማሽ", f"{block:02d} ግማሽ",
@@ -168,7 +201,6 @@ def display_remaining(free_blocks, slots_per_person, keyword="ቀሪ"):
 
 # ─── Event Content Formatter ─────────────────────────────────────
 def format_event_content(event_type: str, data: dict) -> str:
-    """Event → searchable text string"""
     if event_type == "registration":
         return (
             f"user: {data.get('user_request', '')} "
@@ -178,10 +210,7 @@ def format_event_content(event_type: str, data: dict) -> str:
             f"reply: {data.get('bot_reply', '')}"
         )
     elif event_type == "registration_failed":
-        return (
-            f"block: {data.get('block')} taken "
-            f"reply: {data.get('bot_reply', '')}"
-        )
+        return f"block: {data.get('block')} taken reply: {data.get('bot_reply', '')}"
     elif event_type == "payment":
         return (
             f"payment name: {data.get('name', '')} "
@@ -229,7 +258,6 @@ def simulate_game(game_id):
             "content":    format_event_content(event_type, data),
         })
 
-    # ── 1. Registration ──────────────────────────────────────────
     blocks = list(range(1, total_blocks + 1))
     random.shuffle(blocks)
 
@@ -258,8 +286,8 @@ def simulate_game(game_id):
             elif remaining <= cfg["low_slots_threshold"]:
                 bot_reply = "እሺ ይፍጠን 🙏" if lang == "am" else "Hurry up! 🙏"
             else:
-                bot_reply = random.choice(REGISTRATION_REPLIES_AM) if lang == "am" \
-                            else random.choice(REGISTRATION_REPLIES_EN)
+                bot_reply = (random.choice(REGISTRATION_REPLIES_AM) if lang == "am"
+                             else random.choice(REGISTRATION_REPLIES_EN))
 
             log("registration", {
                 "user_request": req, "block": block,
@@ -275,38 +303,31 @@ def simulate_game(game_id):
                 board_active = True
                 msg_count    = 0
                 log("board_with_remaining", {
-                    "trigger":           "low_slots",
-                    "board":             display_board(board),
-                    "remaining":         display_remaining(free_blocks, spp, keyword),
-                    "remaining_keyword": keyword,
-                    "free_count":        remaining,
-                    "bot_action":        "send_board_and_remaining",
+                    "trigger":    "low_slots",
+                    "board":      display_board(board),
+                    "remaining":  display_remaining(free_blocks, spp, keyword),
+                    "free_count": remaining,
                 })
             elif board_active:
                 log("remaining_update", {
-                    "trigger":           "slot_taken",
-                    "remaining":         display_remaining(free_blocks, spp, keyword),
-                    "remaining_keyword": keyword,
-                    "bot_action":        "delete_old_remaining_send_new",
+                    "trigger":   "slot_taken",
+                    "remaining": display_remaining(free_blocks, spp, keyword),
                 })
                 if msg_count >= 4:
                     msg_count = 0
                     log("board_move", {
-                        "trigger":    "4_messages",
-                        "board":      display_board(board),
-                        "remaining":  display_remaining(free_blocks, spp, keyword),
-                        "bot_action": "delete_old_board_send_new",
+                        "trigger":   "4_messages",
+                        "board":     display_board(board),
+                        "remaining": display_remaining(free_blocks, spp, keyword),
                     })
         else:
-            reply = random.choice(TAKEN_REPLIES_AM) if random.random() < 0.7 \
-                    else random.choice(TAKEN_REPLIES_EN)
-            log("registration_failed", {
-                "block": block, "reason": reason, "bot_reply": reply,
-            })
+            reply = (random.choice(TAKEN_REPLIES_AM) if random.random() < 0.7
+                     else random.choice(TAKEN_REPLIES_EN))
+            log("registration_failed", {"block": block, "reason": reason, "bot_reply": reply})
 
         now += timedelta(minutes=random.randint(1, 10))
 
-    # ── 2. Payment ───────────────────────────────────────────────
+    # Payment
     for num, slot in board.slots.items():
         if not slot.is_taken:
             continue
@@ -315,52 +336,36 @@ def simulate_game(game_id):
             continue
         if random.random() < 0.8:
             amount = cfg["price_half"] if slot.is_half else cfg["price_full"]
-            if slot.partner and random.random() < 0.5:
-                amount = cfg["price_half"]
             updated, rem = board.apply_payment(slot.name, amount)
             log("payment", {
                 "name": slot.name, "amount": amount,
                 "updated_slots": updated, "remaining_balance": rem,
-                "bot_reply": f"{slot.name} ✅ ገቢ 🙏" if rem == 0
-                             else f"{slot.name} {rem}ብር ቀርቷል ጨምር 🙏",
+                "bot_reply": (f"{slot.name} ✅ ገቢ 🙏" if rem == 0
+                              else f"{slot.name} {rem}ብር ቀርቷል ጨምር 🙏"),
             })
         now += timedelta(minutes=random.randint(1, 5))
 
-    # ── 3. Unpaid Warning ─────────────────────────────────────────
+    # Unpaid Warning
     unpaid = board.get_unpaid_blocks()
     if unpaid:
         log("unpaid_warning", {
             "unpaid_blocks": unpaid,
             "bot_message":   "⚠️ 2 ደቂቃ ይቀራል! ያልከፈሉ:\n" + "\n".join(unpaid),
         })
-        for b_str in unpaid:
-            b     = int(b_str.replace("+", ""))
-            start = board.get_block_start(b)
-            slot  = board.slots[start]
-            if random.random() < 0.6:
-                amount = cfg["price_half"] if "+" in b_str else cfg["price_full"]
-                board.apply_payment(slot.name, amount)
-                log("late_payment", {"block": b, "name": slot.name, "amount": amount})
-            else:
-                for i in range(spp):
-                    board.slots[start + i].__init__(start + i)
-                log("slot_removed", {"block": b, "reason": "unpaid timeout"})
-        now += timedelta(minutes=2)
 
-    # ── 4. Final Board ───────────────────────────────────────────
+    # Final Board
     log("all_paid_board", {
         "board":       display_board(board),
         "bot_message": "🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏",
-        "bot_action":  "send_final_board_keep_forever",
     })
 
-    # ── 5. Winner ────────────────────────────────────────────────
-    taken    = [b for b in range(1, total_blocks+1) if not board.is_block_free(b)]
-    w_count  = min(cfg["winners_count"], len(taken))
+    # Winners
+    taken   = [b for b in range(1, total_blocks + 1) if not board.is_block_free(b)]
+    w_count = min(cfg["winners_count"], len(taken))
     w_blocks = random.sample(taken, w_count)
-    prizes   = [cfg["prize_1st"], cfg["prize_2nd"], cfg["prize_3rd"]]
-    medals   = ["🥇 1ኛ", "🥈 2ኛ", "🥉 3ኛ"]
-    w_names  = []
+    prizes  = [cfg["prize_1st"], cfg["prize_2nd"], cfg["prize_3rd"]]
+    medals  = ["🥇 1ኛ", "🥈 2ኛ", "🥉 3ኛ"]
+    w_names = []
 
     for rank, blk in enumerate(w_blocks):
         start = board.get_block_start(blk)
@@ -368,11 +373,10 @@ def simulate_game(game_id):
         prize = prizes[rank] if rank < len(prizes) else 0
         w_names.append(name)
         log("winner", {
-            "rank": rank+1, "block": blk, "name": name, "prize": prize,
+            "rank": rank + 1, "block": blk, "name": name, "prize": prize,
             "bot_message": f"{medals[rank]}: {name} — {prize}ብር",
         })
 
-    # ── 6. Winner Balance ─────────────────────────────────────────
     for rank, (blk, name) in enumerate(zip(w_blocks, w_names)):
         prize   = prizes[rank] if rank < len(prizes) else 0
         sent    = (random.randint(0, prize) // cfg["price_half"]) * cfg["price_half"]
@@ -381,14 +385,10 @@ def simulate_game(game_id):
             "name": name, "prize": prize,
             "admin_sent": sent, "balance": balance,
             "auto_approved": updated, "auto_removed": removed,
-            "admin_message": f"{rank+1}={sent}",
+            "admin_message": f"{rank + 1}={sent}",
         })
 
-    # ── 7. New Game ───────────────────────────────────────────────
-    log("new_game", {
-        "bot_message": "🎰 አዲስ ጨዋታ ተጀምሯል! መልካም ዕድል 🙏",
-        "bot_action":  "send_new_empty_board",
-    })
+    log("new_game", {"bot_message": "🎰 አዲስ ጨዋታ ተጀምሯል! መልካም ዕድል 🙏"})
 
     return events
 
@@ -401,7 +401,6 @@ def setup_db():
     conn = get_conn()
     cur  = conn.cursor()
 
-    # Training events table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS training_events (
             id         SERIAL PRIMARY KEY,
@@ -413,29 +412,28 @@ def setup_db():
         )
     """)
 
-    # pgvector extension
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-    # Embeddings table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS training_embeddings (
             id         SERIAL PRIMARY KEY,
             event_id   INTEGER REFERENCES training_events(id),
             event_type TEXT,
             content    TEXT,
-            embedding  vector(384)
+            embedding  vector(1024)
         )
     """)
 
-    # Index for fast search
-    cur.execute("""
+    # NVIDIA NV-Embed = 1024 dim | OpenAI text-embedding-3-small = 1536 dim
+    # .env ላይ EMBED_DIM ቀይር ካስፈለገ
+    embed_dim = int(os.getenv("EMBED_DIM", "1024"))
+    cur.execute(f"""
         CREATE INDEX IF NOT EXISTS embedding_idx
         ON training_embeddings
         USING ivfflat (embedding vector_cosine_ops)
         WITH (lists = 100);
     """)
 
-    # Truncate old data
     cur.execute("TRUNCATE TABLE training_embeddings RESTART IDENTITY;")
     cur.execute("TRUNCATE TABLE training_events RESTART IDENTITY CASCADE;")
 
@@ -449,20 +447,15 @@ def save_events(events):
         return []
     conn = get_conn()
     cur  = conn.cursor()
-
     rows = [
         (e["game_id"], e["event_type"],
          json.dumps(e["data"], ensure_ascii=False),
-         e.get("content", ""),
-         e["timestamp"])
+         e.get("content", ""), e["timestamp"])
         for e in events
     ]
-
     psycopg2.extras.execute_values(
         cur,
-        """INSERT INTO training_events
-           (game_id, event_type, data, content, timestamp)
-           VALUES %s RETURNING id""",
+        "INSERT INTO training_events (game_id, event_type, data, content, timestamp) VALUES %s RETURNING id",
         rows
     )
     ids = [r[0] for r in cur.fetchall()]
@@ -476,21 +469,13 @@ def save_embeddings(event_ids, events, embeddings):
         return
     conn = get_conn()
     cur  = conn.cursor()
-
-    rows = []
-    for eid, event, emb in zip(event_ids, events, embeddings):
-        rows.append((
-            eid,
-            event["event_type"],
-            event.get("content", ""),
-            emb.tolist(),
-        ))
-
+    rows = [
+        (eid, event["event_type"], event.get("content", ""), emb)
+        for eid, event, emb in zip(event_ids, events, embeddings)
+    ]
     psycopg2.extras.execute_values(
         cur,
-        """INSERT INTO training_embeddings
-           (event_id, event_type, content, embedding)
-           VALUES %s""",
+        "INSERT INTO training_embeddings (event_id, event_type, content, embedding) VALUES %s",
         rows
     )
     conn.commit()
@@ -502,19 +487,18 @@ def run_training(num_games=5000):
     print(f"🚀 Training ጀምሯል — {num_games} games...")
     setup_db()
 
-    model        = get_embed_model()
     total_events = 0
-    CHUNK        = 50  # 50 games per batch
+    CHUNK        = 50
 
     for game_id in range(1, num_games + 1):
         chunk_events = simulate_game(game_id)
 
-        # 1. Save events → get IDs
+        # 1. Save events
         event_ids = save_events(chunk_events)
 
-        # 2. Embed contents
+        # 2. Embed — API (sentence-transformers አያስፈልግም!)
         contents   = [e.get("content", "") for e in chunk_events]
-        embeddings = model.encode(contents, batch_size=64, show_progress_bar=False)
+        embeddings = embed_texts(contents)
 
         # 3. Save embeddings
         save_embeddings(event_ids, chunk_events, embeddings)
