@@ -5,7 +5,7 @@ import logging
 import psycopg2
 import psycopg2.extras
 from openai import OpenAI
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -17,11 +17,14 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_IDS      = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-EMBED_MODEL    = "text-embedding-3-small"
 
-# OpenAI client — embedding ለብቻ
-openai_client  = OpenAI(api_key=OPENAI_API_KEY)
+# ── Embedding config — .env ላይ ብቻ ቀይር ──────────────────────────
+# embed_training.py ጋር አንድ አይነት መሆን አለበት!
+# NVIDIA:  EMBED_MODEL=nvidia/nv-embedqa-e5-v5   EMBED_DIM=1024
+# OpenAI:  EMBED_MODEL=text-embedding-3-small    EMBED_DIM=1536
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+EMBED_DIM   = int(os.getenv("EMBED_DIM", "1024"))
+
 
 # ══════════════════════════════════════════════════════════════════
 # 1. DB CONNECTION
@@ -32,27 +35,35 @@ def get_conn():
 
 
 # ══════════════════════════════════════════════════════════════════
-# 2. RAG — pgvector embedding search
+# 2. EMBEDDING — config ጋር unified
 # ══════════════════════════════════════════════════════════════════
 
 def get_embedding(text: str) -> list:
-    """User message → vector"""
-    try:
-        resp = openai_client.embeddings.create(
-            model=EMBED_MODEL,
-            input=text,
-        )
-        return resp.data[0].embedding
-    except Exception as e:
-        logger.error(f"Embedding error: {e}")
-        return []
+    """User message → vector (embed_training.py ጋር አንድ አይነት)"""
+    while True:
+        try:
+            client = OpenAI(api_key=get_api_key(), base_url=BASE_URL)
+            resp   = client.embeddings.create(
+                model=EMBED_MODEL,
+                input=text,
+            )
+            return resp.data[0].embedding
+        except Exception as e:
+            err = str(e).lower()
+            if "rate limit" in err or "429" in err or "quota" in err:
+                logger.warning(f"Embedding rate limit — rotating key")
+                rotate_key()
+            else:
+                logger.error(f"Embedding error: {e}")
+                return []
 
+
+# ══════════════════════════════════════════════════════════════════
+# 3. RAG — pgvector similarity search
+# ══════════════════════════════════════════════════════════════════
 
 def rag_search(user_message: str, limit: int = 6) -> list:
-    """
-    pgvector cosine similarity search —
-    user message ጋር ቅርብ training examples ያመጣል
-    """
+    """user message ጋር ቅርብ training examples ያመጣል"""
     embedding = get_embedding(user_message)
     if not embedding:
         return []
@@ -60,8 +71,6 @@ def rag_search(user_message: str, limit: int = 6) -> list:
     try:
         conn = get_conn()
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-        # Vector similarity search
         cur.execute("""
             SELECT
                 emb.event_type,
@@ -73,39 +82,33 @@ def rag_search(user_message: str, limit: int = 6) -> list:
             ORDER BY emb.embedding <=> %s::vector
             LIMIT %s
         """, (embedding, embedding, limit))
-
         rows = cur.fetchall()
         cur.close()
         conn.close()
         return [dict(r) for r in rows]
-
     except Exception as e:
         logger.error(f"RAG search error: {e}")
         return []
 
 
 def format_rag_context(events: list) -> str:
-    """RAG examples → AI readable string"""
     if not events:
         return ""
     lines = ["=== Training Examples ==="]
     for e in events:
         sim = e.get("similarity", 0)
         lines.append(f"[{e['event_type']}] (similarity: {sim:.2f})")
-        # content — already formatted text
         lines.append(f"  {e.get('content', '')}")
         lines.append("")
     return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3. AI CALL — any model, auto rotate
+# 4. AI CALL — auto rotate
 # ══════════════════════════════════════════════════════════════════
 
 def call_ai(messages: list, system_prompt: str = None) -> str:
-    """Rate limit ሲመጣ auto rotate ያደርጋል"""
     from config import API_KEYS
-
     if system_prompt:
         messages = [{"role": "system", "content": system_prompt}] + messages
 
@@ -130,17 +133,14 @@ def call_ai(messages: list, system_prompt: str = None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 4. GAME STATE — active boards per chat
+# 5. GAME STATE
 # ══════════════════════════════════════════════════════════════════
 
 from game_logic import Board, parse_request
 
-# chat_id → Board
-active_boards: dict[int, Board] = {}
-# chat_id → message_id of current board message
-board_message_ids: dict[int, int] = {}
-# chat_id → message_id of current remaining message
-remaining_message_ids: dict[int, int] = {}
+active_boards:          dict[int, Board] = {}
+board_message_ids:      dict[int, int]   = {}
+remaining_message_ids:  dict[int, int]   = {}
 
 
 def get_board(chat_id: int) -> Board:
@@ -150,7 +150,7 @@ def get_board(chat_id: int) -> Board:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. DISPLAY HELPERS
+# 6. DISPLAY HELPERS
 # ══════════════════════════════════════════════════════════════════
 
 def build_board_text(board: Board) -> str:
@@ -177,7 +177,6 @@ def build_board_text(board: Board) -> str:
     for i in range(1, total + 1):
         slot        = board.slots[i]
         block_start = ((i - 1) // spp) * spp + 1
-
         if i == block_start and slot.name:
             mark     = "✅" if slot.paid_main  else ""
             reminder = "❓" if slot.reminder   else ""
@@ -190,11 +189,9 @@ def build_board_text(board: Board) -> str:
                 lines.append(f"{i:02d}# {slot.name}{mark}{reminder}")
         else:
             lines.append(f"{i:02d}#")
-
         if i % spp == 0 and i < total:
             lines.append("")
 
-    # Footer
     lines.append("")
     if cfg.get("cbe_account"):
         lines.append(f"CBE {cfg['cbe_account']} {cfg.get('cbe_name','')}")
@@ -209,10 +206,10 @@ def build_board_text(board: Board) -> str:
 
 
 def build_remaining_text(board: Board, keyword: str = "ቀሪ") -> str:
-    cfg        = get_game_config()
-    spp        = cfg["slots_per_person"]
-    free       = board.get_free_blocks(include_half=True)
-    lines      = [keyword]
+    cfg   = get_game_config()
+    spp   = cfg["slots_per_person"]
+    free  = board.get_free_blocks(include_half=True)
+    lines = [keyword]
     for b in free:
         if isinstance(b, int):
             start = (b - 1) * spp + 1
@@ -225,24 +222,17 @@ def build_remaining_text(board: Board, keyword: str = "ቀሪ") -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6. AI DECISION — ምን ማድረግ እንዳለበት ይወስናል
+# 7. AI DECISION
 # ══════════════════════════════════════════════════════════════════
 
 def ai_decide(chat_id: int, user_text: str, user_name: str, is_admin: bool) -> dict:
-    """
-    RAG + AI ተጠቅሞ action ይወስናል።
-    Returns: {"action": ..., "reply": ..., "data": ...}
-    """
     board = get_board(chat_id)
     cfg   = get_game_config()
 
-    # ─ RAG examples ─
-    events   = rag_search(user_text, limit=6)
-    rag_ctx  = format_rag_context(events)
-
-    # ─ Board state ─
-    free_blocks  = board.get_free_blocks()
-    taken_blocks = cfg["slots_total"] // cfg["slots_per_person"] - len(free_blocks)
+    events      = rag_search(user_text, limit=6)
+    rag_ctx     = format_rag_context(events)
+    free_blocks = board.get_free_blocks()
+    taken       = cfg["slots_total"] // cfg["slots_per_person"] - len(free_blocks)
 
     system_prompt = f"""
 You are a Telegram lottery bot assistant for an Ethiopian lottery game.
@@ -250,7 +240,7 @@ You understand both Amharic and English messages.
 
 GAME STATE:
 - Total blocks: {cfg['slots_total'] // cfg['slots_per_person']}
-- Taken: {taken_blocks}
+- Taken: {taken}
 - Free: {len(free_blocks)}
 - Price full: {cfg['price_full']} ETB
 - Price half: {cfg['price_half']} ETB
@@ -282,10 +272,8 @@ INSTRUCTIONS:
 """
 
     messages = [{"role": "user", "content": user_text}]
-
     try:
         raw  = call_ai(messages, system_prompt)
-        # JSON parse
         raw  = re.sub(r"```json|```", "", raw).strip()
         data = json.loads(raw)
         return data
@@ -295,7 +283,7 @@ INSTRUCTIONS:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. ACTION EXECUTOR — AI decision ይፈጽማል
+# 8. ACTION EXECUTOR
 # ══════════════════════════════════════════════════════════════════
 
 async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -307,109 +295,85 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
     reply   = decision.get("reply", "ይቅርታ 🙏")
     data    = decision.get("data", {})
 
-    # ─ REGISTER ─────────────────────────────────────────────────
+    async def update_board_remaining():
+        free   = board.get_free_blocks()
+        low_th = cfg["low_slots_threshold"]
+        if len(free) == low_th:
+            bm = await context.bot.send_message(chat_id, build_board_text(board))
+            rm = await context.bot.send_message(chat_id, build_remaining_text(board))
+            board_message_ids[chat_id]     = bm.message_id
+            remaining_message_ids[chat_id] = rm.message_id
+        elif len(free) < low_th:
+            if chat_id in remaining_message_ids:
+                try:
+                    await context.bot.delete_message(chat_id, remaining_message_ids[chat_id])
+                except Exception:
+                    pass
+            rm = await context.bot.send_message(chat_id, build_remaining_text(board))
+            remaining_message_ids[chat_id] = rm.message_id
+        if len(free) == 0:
+            await context.bot.send_message(
+                chat_id, build_board_text(board) + "\n\n🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏")
+
+    # ─ REGISTER ─
     if action == "register":
         block   = data.get("block")
         is_half = data.get("is_half", False)
         name    = data.get("name") or user_name
-
         if block:
             success, reason = board.register(block, name, is_half)
+            await update.message.reply_text(reply)
             if success:
-                free   = board.get_free_blocks()
-                low_th = cfg["low_slots_threshold"]
-
-                await update.message.reply_text(reply)
-
-                # Low slots → board + remaining
-                if len(free) == low_th:
-                    board_text = build_board_text(board)
-                    rem_text   = build_remaining_text(board)
-                    bm = await context.bot.send_message(chat_id, board_text)
-                    rm = await context.bot.send_message(chat_id, rem_text)
-                    board_message_ids[chat_id]     = bm.message_id
-                    remaining_message_ids[chat_id] = rm.message_id
-
-                # Already low → update remaining
-                elif len(free) < low_th:
-                    rem_text = build_remaining_text(board)
-                    # Delete old remaining
-                    if chat_id in remaining_message_ids:
-                        try:
-                            await context.bot.delete_message(
-                                chat_id, remaining_message_ids[chat_id])
-                        except Exception:
-                            pass
-                    rm = await context.bot.send_message(chat_id, rem_text)
-                    remaining_message_ids[chat_id] = rm.message_id
-
-                # Full → final board
-                if len(free) == 0:
-                    board_text = build_board_text(board)
-                    await context.bot.send_message(
-                        chat_id, board_text + "\n\n🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏")
-            else:
-                await update.message.reply_text(reply)
+                await update_board_remaining()
         else:
             await update.message.reply_text(reply)
 
-    # ─ PAYMENT ──────────────────────────────────────────────────
+    # ─ PAYMENT ─
     elif action == "payment":
         amount = data.get("amount", 0)
         if amount:
-            updated, remaining = board.apply_payment(user_name, amount)
-            await update.message.reply_text(reply)
-        else:
-            await update.message.reply_text(reply)
+            board.apply_payment(user_name, amount)
+        await update.message.reply_text(reply)
 
-    # ─ SHOW BOARD ───────────────────────────────────────────────
+    # ─ SHOW BOARD ─
     elif action == "show_board":
-        board_text = build_board_text(board)
-        bm = await update.message.reply_text(board_text)
+        bm = await update.message.reply_text(build_board_text(board))
         board_message_ids[chat_id] = bm.message_id
 
-    # ─ SHOW REMAINING ───────────────────────────────────────────
+    # ─ SHOW REMAINING ─
     elif action == "show_remaining":
-        rem_text = build_remaining_text(board)
-        await update.message.reply_text(rem_text)
+        await update.message.reply_text(build_remaining_text(board))
 
-    # ─ TRANSFER ─────────────────────────────────────────────────
+    # ─ TRANSFER ─
     elif action == "transfer":
         from_b = data.get("from_block")
         to_b   = data.get("to_block")
         if from_b and to_b:
-            success, msg = board.transfer(from_b, to_b)
-            await update.message.reply_text(reply)
-        else:
-            await update.message.reply_text(reply)
+            board.transfer(from_b, to_b)
+        await update.message.reply_text(reply)
 
-    # ─ CLEAR SLOT ───────────────────────────────────────────────
+    # ─ CLEAR SLOT ─
     elif action == "clear_slot":
         block = data.get("block")
         if block:
             start = board.get_block_start(block)
-            spp   = cfg["slots_per_person"]
-            for i in range(spp):
+            for i in range(cfg["slots_per_person"]):
                 board.slots[start + i].__init__(start + i)
-            await update.message.reply_text(reply)
-        else:
-            await update.message.reply_text(reply)
+        await update.message.reply_text(reply)
 
-    # ─ NEW GAME ─────────────────────────────────────────────────
+    # ─ NEW GAME ─
     elif action == "new_game":
-        active_boards[chat_id]        = Board()
+        active_boards[chat_id] = Board()
         board_message_ids.pop(chat_id, None)
         remaining_message_ids.pop(chat_id, None)
-        board_text = build_board_text(active_boards[chat_id])
         await update.message.reply_text(reply)
-        await context.bot.send_message(chat_id, board_text)
+        await context.bot.send_message(chat_id, build_board_text(active_boards[chat_id]))
 
-    # ─ WINNER ───────────────────────────────────────────────────
+    # ─ WINNER ─
     elif action == "winner":
         import random
-        taken   = [b for b in range(
-            1, cfg["slots_total"] // cfg["slots_per_person"] + 1)
-            if not board.is_block_free(b)]
+        taken   = [b for b in range(1, cfg["slots_total"] // cfg["slots_per_person"] + 1)
+                   if not board.is_block_free(b)]
         w_count = min(cfg["winners_count"], len(taken))
         if w_count == 0:
             await update.message.reply_text("ያዘ የለም! 🙏")
@@ -425,55 +389,46 @@ async def execute_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
             lines.append(f"{medals[rank]}: {name} — {prize} ብር")
         await update.message.reply_text("\n".join(lines))
 
-    # ─ UNKNOWN ──────────────────────────────────────────────────
+    # ─ UNKNOWN ─
     else:
         await update.message.reply_text(reply)
 
 
 # ══════════════════════════════════════════════════════════════════
-# 8. TELEGRAM HANDLERS
+# 9. TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cfg  = get_game_config()
-    board = get_board(update.effective_chat.id)
     await update.message.reply_text(
         "🎰 እንኳን ደህና መጡ!\n/board — board ይመልከቱ\n/remaining — ቀሪ slots"
     )
 
 async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id    = update.effective_chat.id
-    board      = get_board(chat_id)
-    board_text = build_board_text(board)
-    bm = await update.message.reply_text(board_text)
+    chat_id = update.effective_chat.id
+    bm = await update.message.reply_text(build_board_text(get_board(chat_id)))
     board_message_ids[chat_id] = bm.message_id
 
 async def cmd_remaining(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    board    = get_board(update.effective_chat.id)
-    rem_text = build_remaining_text(board)
-    await update.message.reply_text(rem_text)
+    await update.message.reply_text(build_remaining_text(get_board(update.effective_chat.id)))
 
 async def cmd_new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Admin ብቻ ነው!")
         return
-    active_boards[chat_id]        = Board()
+    active_boards[chat_id] = Board()
     board_message_ids.pop(chat_id, None)
     remaining_message_ids.pop(chat_id, None)
-    board_text = build_board_text(active_boards[chat_id])
     await update.message.reply_text("🎰 አዲስ ጨዋታ ተጀምሯል! መልካም ዕድል 🙏")
-    await context.bot.send_message(chat_id, board_text)
+    await context.bot.send_message(chat_id, build_board_text(active_boards[chat_id]))
 
 async def cmd_winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Admin ብቻ ነው!")
         return
-    decision = {"action": "winner", "reply": "", "data": {}}
-    await execute_action(update, context, decision, "")
+    await execute_action(update, context, {"action": "winner", "reply": "", "data": {}}, "")
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ሁሉም messages — AI ይወስናል"""
     if not update.message or not update.message.text:
         return
 
@@ -483,7 +438,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_admin  = user.id in ADMIN_IDS
     text      = update.message.text.strip()
 
-    # ─ Quick parse — ቁጥር ብቻ ከሆነ directly register ─
+    # ─ Quick parse — ቁጥር ከሆነ directly register (ፈጣን) ─
     parsed = parse_request(text)
     if parsed:
         board = get_board(chat_id)
@@ -495,41 +450,33 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             low_th  = cfg["low_slots_threshold"]
 
             if success:
-                if len(free) == 0:
-                    reply = "ጨዋታ ተሞልቷል 🙏"
-                elif len(free) <= low_th:
-                    reply = "እሺ ይፍጠን 🙏"
-                else:
-                    reply = "እሺ 🙏 ገቢ"
+                reply = ("ጨዋታ ተሞልቷል 🙏" if len(free) == 0
+                         else "እሺ ይፍጠን 🙏" if len(free) <= low_th
+                         else "እሺ 🙏 ገቢ")
             else:
                 reply = "ተቀደምክ 🙏" if reason == "taken" else "ይቅርታ 🙏"
 
             await update.message.reply_text(reply)
 
-            # Board/remaining logic
             if success:
                 if len(free) == low_th:
-                    board_text = build_board_text(board)
-                    rem_text   = build_remaining_text(board)
-                    bm = await context.bot.send_message(chat_id, board_text)
-                    rm = await context.bot.send_message(chat_id, rem_text)
+                    bm = await context.bot.send_message(chat_id, build_board_text(board))
+                    rm = await context.bot.send_message(chat_id, build_remaining_text(board))
                     board_message_ids[chat_id]     = bm.message_id
                     remaining_message_ids[chat_id] = rm.message_id
                 elif len(free) < low_th:
-                    rem_text = build_remaining_text(board)
                     if chat_id in remaining_message_ids:
                         try:
                             await context.bot.delete_message(
                                 chat_id, remaining_message_ids[chat_id])
                         except Exception:
                             pass
-                    rm = await context.bot.send_message(chat_id, rem_text)
+                    rm = await context.bot.send_message(chat_id, build_remaining_text(board))
                     remaining_message_ids[chat_id] = rm.message_id
                 if len(free) == 0:
-                    board_text = build_board_text(board)
                     await context.bot.send_message(
                         chat_id,
-                        board_text + "\n\n🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏")
+                        build_board_text(board) + "\n\n🎰 ዕጣ ማውጫ ሰዓት ደረሰ! መልካም ዕድል 🙏")
         return
 
     # ─ AI decision — ቁጥር ካልሆነ ─
@@ -538,7 +485,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 9. MAIN
+# 10. MAIN
 # ══════════════════════════════════════════════════════════════════
 
 def main():
@@ -547,14 +494,11 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("board",     cmd_board))
     app.add_handler(CommandHandler("remaining", cmd_remaining))
     app.add_handler(CommandHandler("newgame",   cmd_new_game))
     app.add_handler(CommandHandler("winner",    cmd_winner))
-
-    # All messages → AI
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     print("🤖 Bot ጀምሯል...")
