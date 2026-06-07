@@ -53,7 +53,29 @@ def get_embedding(text: str) -> list:
 # 3. VECTOR LOOKUP (አዲስ ⚡ — ፈጣን)
 # ══════════════════════════════════════════════════════════════════
 
-from trainer import extract_features
+def extract_features(event_data: dict, cfg: dict) -> list[float]:
+    total_blocks   = cfg["slots_total"] // cfg["slots_per_person"]
+    data           = event_data.get("data", {})
+    etype          = event_data.get("event_type", "")
+    block          = data.get("block") or 0
+    slot_norm      = block / total_blocks if total_blocks > 0 else 0.0
+    is_half        = 1.0 if data.get("is_half") else 0.0
+    has_partner    = 1.0 if data.get("partner") else 0.0
+    remaining      = data.get("remaining_blocks", total_blocks)
+    remaining_norm = remaining / total_blocks if total_blocks > 0 else 1.0
+    lang_am        = 1.0 if data.get("lang", "am") == "am" else 0.0
+    is_taken       = 1.0 if etype == "registration_failed" else 0.0
+    amount         = data.get("amount", 0) or 0
+    price_full     = cfg["price_full"]
+    payment_norm   = min(amount / price_full, 1.0) if price_full > 0 else 0.0
+    etype_map      = {
+        "registration": 0.1, "registration_failed": 0.2,
+        "payment": 0.3, "unpaid_warning": 0.4,
+        "winner": 0.5, "new_game": 1.0,
+    }
+    etype_enc = etype_map.get(etype, 0.0)
+    return [slot_norm, is_half, has_partner, remaining_norm,
+            lang_am, is_taken, payment_norm, etype_enc]
 
 def vector_lookup(event_data: dict, threshold: float = 0.92) -> str | None:
     """
