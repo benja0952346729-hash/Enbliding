@@ -19,7 +19,6 @@ def get_client():
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """texts → embeddings (rotation ይሠራል)"""
-    # NVIDIA models input_type ይፈልጋሉ — OpenAI አያስፈልጋቸውም
     is_nvidia = "nvidia" in BASE_URL or "nvidia" in EMBED_MODEL.lower()
     extra     = {"input_type": "passage", "truncate": "END"} if is_nvidia else {}
 
@@ -90,8 +89,8 @@ def random_half_keyword(lang="am"):
     return random.choice(HALF_KEYWORDS_EN if lang == "en" else HALF_KEYWORDS_AM)
 
 def format_block_request(block, is_half, lang="am"):
-    kw      = random_half_keyword(lang) if is_half else ""
-    am_num  = AMHARIC_NUMBERS.get(block, "")
+    kw     = random_half_keyword(lang) if is_half else ""
+    am_num = AMHARIC_NUMBERS.get(block, "")
 
     if lang == "en":
         styles = [
@@ -233,6 +232,86 @@ def format_event_content(event_type: str, data: dict) -> str:
     else:
         return json.dumps(data, ensure_ascii=False)[:300]
 
+
+# ══════════════════════════════════════════════════════════════════
+# ── Feature Extraction (አዲስ) ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+
+def extract_features(event: dict, cfg: dict) -> list[float]:
+    """
+    event → normalized feature vector
+    [slot_norm, is_half, has_partner, remaining_norm, lang_am,
+     is_taken, payment_norm, event_type_enc]
+    """
+    total_blocks = cfg["slots_total"] // cfg["slots_per_person"]
+    data         = event.get("data", {})
+    etype        = event.get("event_type", "")
+
+    # slot normalized (0.0 - 1.0)
+    block      = data.get("block") or 0
+    slot_norm  = block / total_blocks if total_blocks > 0 else 0.0
+
+    # is_half
+    is_half    = 1.0 if data.get("is_half") else 0.0
+
+    # has_partner
+    has_partner = 1.0 if data.get("partner") else 0.0
+
+    # remaining normalized
+    remaining      = data.get("remaining_blocks", total_blocks)
+    remaining_norm = remaining / total_blocks if total_blocks > 0 else 1.0
+
+    # language (1=am, 0=en)
+    lang_am = 1.0 if data.get("lang", "am") == "am" else 0.0
+
+    # is_taken (registration_failed = taken)
+    is_taken = 1.0 if etype == "registration_failed" else 0.0
+
+    # payment normalized
+    amount       = data.get("amount", 0) or 0
+    price_full   = cfg["price_full"]
+    payment_norm = min(amount / price_full, 1.0) if price_full > 0 else 0.0
+
+    # event type encoding
+    etype_map = {
+        "registration":        0.1,
+        "registration_failed": 0.2,
+        "payment":             0.3,
+        "unpaid_warning":      0.4,
+        "winner":              0.5,
+        "winner_balance":      0.6,
+        "board_with_remaining":0.7,
+        "remaining_update":    0.8,
+        "board_move":          0.85,
+        "all_paid_board":      0.9,
+        "new_game":            1.0,
+    }
+    etype_enc = etype_map.get(etype, 0.0)
+
+    return [
+        slot_norm,
+        is_half,
+        has_partner,
+        remaining_norm,
+        lang_am,
+        is_taken,
+        payment_norm,
+        etype_enc,
+    ]
+
+
+def get_reply_from_event(event: dict) -> str:
+    """event → bot reply"""
+    data  = event.get("data", {})
+    etype = event.get("event_type", "")
+    if etype in ("registration", "registration_failed", "payment"):
+        return data.get("bot_reply", "")
+    elif etype in ("unpaid_warning", "winner", "new_game",
+                   "all_paid_board", "board_with_remaining"):
+        return data.get("bot_message", "")
+    return ""
+
+
 # ─── Simulate 1 Game ─────────────────────────────────────────────
 def simulate_game(game_id):
     board  = Board()
@@ -357,12 +436,12 @@ def simulate_game(game_id):
     })
 
     # Winners
-    taken   = [b for b in range(1, total_blocks + 1) if not board.is_block_free(b)]
-    w_count = min(cfg["winners_count"], len(taken))
+    taken    = [b for b in range(1, total_blocks + 1) if not board.is_block_free(b)]
+    w_count  = min(cfg["winners_count"], len(taken))
     w_blocks = random.sample(taken, w_count)
-    prizes  = [cfg["prize_1st"], cfg["prize_2nd"], cfg["prize_3rd"]]
-    medals  = ["🥇 1ኛ", "🥈 2ኛ", "🥉 3ኛ"]
-    w_names = []
+    prizes   = [cfg["prize_1st"], cfg["prize_2nd"], cfg["prize_3rd"]]
+    medals   = ["🥇 1ኛ", "🥈 2ኛ", "🥉 3ኛ"]
+    w_names  = []
 
     for rank, blk in enumerate(w_blocks):
         start = board.get_block_start(blk)
@@ -389,7 +468,11 @@ def simulate_game(game_id):
 
     return events
 
-# ─── Database ────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+# ── Database ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
@@ -398,15 +481,14 @@ def setup_db():
     conn = get_conn()
     cur  = conn.cursor()
 
-    # ── ሙሉ clean start ──────────────────────────────────────────
     cur.execute("DROP TABLE IF EXISTS training_embeddings CASCADE;")
     cur.execute("DROP TABLE IF EXISTS training_events CASCADE;")
+    cur.execute("DROP TABLE IF EXISTS vector_store CASCADE;")      # አዲስ
     print("🗑️ ያሉ tables ተሰርዘዋል")
 
-    # ── Extension ───────────────────────────────────────────────
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-    # ── training_events ─────────────────────────────────────────
+    # training_events
     cur.execute("""
         CREATE TABLE training_events (
             id         SERIAL PRIMARY KEY,
@@ -418,7 +500,7 @@ def setup_db():
         )
     """)
 
-    # ── training_embeddings ──────────────────────────────────────
+    # training_embeddings (RAG — እንደቀደመው)
     embed_dim = int(os.getenv("EMBED_DIM", "1024"))
     cur.execute(f"""
         CREATE TABLE training_embeddings (
@@ -429,13 +511,28 @@ def setup_db():
             embedding  vector({embed_dim})
         )
     """)
-
-    # ── Index ────────────────────────────────────────────────────
     cur.execute("""
         CREATE INDEX embedding_idx
         ON training_embeddings
         USING ivfflat (embedding vector_cosine_ops)
         WITH (lists = 100);
+    """)
+
+    # ── vector_store (አዲስ — feature vectors) ────────────────────
+    cur.execute("""
+        CREATE TABLE vector_store (
+            id         SERIAL PRIMARY KEY,
+            event_id   INTEGER REFERENCES training_events(id),
+            event_type TEXT,
+            features   vector(8),
+            reply      TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX vector_store_idx
+        ON vector_store
+        USING ivfflat (features vector_cosine_ops)
+        WITH (lists = 50);
     """)
 
     conn.commit()
@@ -483,7 +580,34 @@ def save_embeddings(event_ids, events, embeddings):
     cur.close()
     conn.close()
 
-# ─── Main ────────────────────────────────────────────────────────
+def save_vectors(event_ids, events):
+    """feature vectors → vector_store (አዲስ)"""
+    if not event_ids:
+        return
+    cfg  = get_game_config()
+    conn = get_conn()
+    cur  = conn.cursor()
+    rows = []
+    for eid, event in zip(event_ids, events):
+        features = extract_features(event, cfg)
+        reply    = get_reply_from_event(event)
+        if reply:  # reply ያለው ብቻ
+            rows.append((eid, event["event_type"], features, reply))
+    if rows:
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO vector_store (event_id, event_type, features, reply) VALUES %s",
+            rows
+        )
+        conn.commit()
+    cur.close()
+    conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════
+# ── Main ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+
 def run_training(num_games=5000):
     print(f"🚀 Training ጀምሯል — {num_games} games...")
     setup_db()
@@ -500,19 +624,23 @@ def run_training(num_games=5000):
         event_ids = save_events(chunk_events)
         print(f"💾 Events saved — embedding...", flush=True)
 
-        # 2. Embed
+        # 2. Embed (RAG)
         contents   = [e.get("content", "") for e in chunk_events]
         embeddings = embed_texts(contents)
         print(f"🔢 Embeddings done!", flush=True)
 
-        # 3. Save embeddings
+        # 3. Save embeddings (RAG)
         save_embeddings(event_ids, chunk_events, embeddings)
+
+        # 4. Save feature vectors (አዲስ ⚡)
+        save_vectors(event_ids, chunk_events)
+        print(f"⚡ Feature vectors saved!", flush=True)
 
         total_events += len(chunk_events)
 
         if game_id % CHUNK == 0:
             pct = int(game_id / num_games * 100)
-            print(f"✅ {game_id}/{num_games} ({pct}%) — {total_events} events embedded", flush=True)
+            print(f"✅ {game_id}/{num_games} ({pct}%) — {total_events} events", flush=True)
 
     print(f"\n🎉 ተጠናቋል!")
     print(f"   Games:  {num_games}")
