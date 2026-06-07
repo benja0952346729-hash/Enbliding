@@ -27,39 +27,89 @@ MODEL    = os.getenv("AI_MODEL",    "deepseek-ai/deepseek-r1")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ══════════════════════════════════════════════════════════════════
-# GAME CONFIG — ሁሌ fresh ያነባዋል (.env ሲቀየር auto ይሰራል)
+# GAME CONFIG — DB ያነባል → .env fallback → defaults
 # ══════════════════════════════════════════════════════════════════
 
-def get_game_config() -> dict:
+_DEFAULTS = {
+    "slots_total":         100,
+    "slots_per_person":    5,
+    "price_full":          400,
+    "price_half":          200,
+    "prize_1st":           5000,
+    "prize_2nd":           1000,
+    "prize_3rd":           400,
+    "winners_count":       3,
+    "warning_minutes":     2,
+    "low_slots_threshold": 7,
+    "cbe_account":         None,
+    "cbe_name":            None,
+    "awash_account":       None,
+    "dashen_account":      None,
+    "tele_birr":           None,
+}
+
+def _env_fallback() -> dict:
+    """DB ካልሆነ .env ያነባል"""
     load_dotenv(override=True)
     return {
-        # Board
-        "slots_total":         int(os.getenv("SLOTS_TOTAL",         100)),
-        "slots_per_person":    int(os.getenv("SLOTS_PER_PERSON",    5)),
-
-        # Prices
-        "price_full":          int(os.getenv("PRICE_FULL",          400)),
-        "price_half":          int(os.getenv("PRICE_HALF",          200)),
-
-        # Prizes
-        "prize_1st":           int(os.getenv("PRIZE_1ST",           5000)),
-        "prize_2nd":           int(os.getenv("PRIZE_2ND",           1000)),
-        "prize_3rd":           int(os.getenv("PRIZE_3RD",           400)),
-        "winners_count":       int(os.getenv("WINNERS_COUNT",       3)),
-
-        # Timing
-        "warning_minutes":     int(os.getenv("WARNING_MINUTES",     2)),
-
-        # UI
-        "low_slots_threshold": int(os.getenv("LOW_SLOTS_THRESHOLD", 7)),
-
-        # Payment Accounts
+        "slots_total":         int(os.getenv("SLOTS_TOTAL",         _DEFAULTS["slots_total"])),
+        "slots_per_person":    int(os.getenv("SLOTS_PER_PERSON",    _DEFAULTS["slots_per_person"])),
+        "price_full":          int(os.getenv("PRICE_FULL",          _DEFAULTS["price_full"])),
+        "price_half":          int(os.getenv("PRICE_HALF",          _DEFAULTS["price_half"])),
+        "prize_1st":           int(os.getenv("PRIZE_1ST",           _DEFAULTS["prize_1st"])),
+        "prize_2nd":           int(os.getenv("PRIZE_2ND",           _DEFAULTS["prize_2nd"])),
+        "prize_3rd":           int(os.getenv("PRIZE_3RD",           _DEFAULTS["prize_3rd"])),
+        "winners_count":       int(os.getenv("WINNERS_COUNT",       _DEFAULTS["winners_count"])),
+        "warning_minutes":     int(os.getenv("WARNING_MINUTES",     _DEFAULTS["warning_minutes"])),
+        "low_slots_threshold": int(os.getenv("LOW_SLOTS_THRESHOLD", _DEFAULTS["low_slots_threshold"])),
         "cbe_account":         os.getenv("CBE_ACCOUNT"),
         "cbe_name":            os.getenv("CBE_NAME"),
         "awash_account":       os.getenv("AWASH_ACCOUNT"),
         "dashen_account":      os.getenv("DASHEN_ACCOUNT"),
         "tele_birr":           os.getenv("TELE_BIRR"),
     }
+
+def get_game_config() -> dict:
+    """
+    1. DB game_config table ያነባል (Repo 1 ያስቀምጣል)
+    2. DB ካልሆነ → .env fallback
+    3. .env ካልሆነ → defaults
+    """
+    if not DATABASE_URL:
+        return _env_fallback()
+
+    try:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT key, value FROM game_config;")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not rows:
+            return _env_fallback()
+
+        db_cfg = {r["key"]: r["value"] for r in rows}
+
+        int_fields = [
+            "slots_total", "slots_per_person", "price_full", "price_half",
+            "prize_1st", "prize_2nd", "prize_3rd", "winners_count",
+            "warning_minutes", "low_slots_threshold",
+        ]
+        result = {}
+        for k, default in _DEFAULTS.items():
+            val = db_cfg.get(k, default)
+            if k in int_fields and val is not None:
+                result[k] = int(val)
+            else:
+                result[k] = val if val != "" else None
+
+        return result
+
+    except Exception:
+        return _env_fallback()
 
 # ══════════════════════════════════════════════════════════════════
 # API KEY ROTATION
