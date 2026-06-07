@@ -492,14 +492,18 @@ def run_training(num_games=5000):
     CHUNK        = 50
 
     for game_id in range(1, num_games + 1):
+        print(f"🎮 Game {game_id} ጀምሯል...", flush=True)
         chunk_events = simulate_game(game_id)
+        print(f"📝 {len(chunk_events)} events — DB saving...", flush=True)
 
         # 1. Save events
         event_ids = save_events(chunk_events)
+        print(f"💾 Events saved — embedding...", flush=True)
 
         # 2. Embed
         contents   = [e.get("content", "") for e in chunk_events]
         embeddings = embed_texts(contents)
+        print(f"🔢 Embeddings done!", flush=True)
 
         # 3. Save embeddings
         save_embeddings(event_ids, chunk_events, embeddings)
